@@ -22,6 +22,11 @@ exports.handler = async (event) => {
   const headers = {};
   for (const k of FWD) if (event.headers[k]) headers[k] = event.headers[k];
 
+  // 本文を確実に復元する
+  const raw = event.body || '';
+  const buf = event.isBase64Encoded ? Buffer.from(raw, 'base64') : Buffer.from(raw, 'utf8');
+  const body = ['GET', 'HEAD'].includes(event.httpMethod) || buf.length === 0 ? undefined : buf;
+
   let dest = q.url;
   const up = event.headers['x-upstream-proxy'];
   if (up) {
@@ -30,7 +35,6 @@ exports.handler = async (event) => {
     if (user) headers['proxy-authorization'] = 'Basic ' + Buffer.from(`${user}:${pass}`).toString('base64');
   }
 
-  const body = ['GET', 'HEAD'].includes(event.httpMethod) ? undefined : event.body;
   const r = await fetch(dest, { method: event.httpMethod, headers, body });
 
   const out = { ...cors };
