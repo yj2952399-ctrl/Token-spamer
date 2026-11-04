@@ -52,7 +52,7 @@
     color:var(--host-fg-muted);white-space:nowrap}
   .badge.ok{color:var(--host-success);border-color:var(--host-success)}
   .badge.bad{color:var(--host-error);border-color:var(--host-error)}
-  #log{height:180px;overflow-y:auto;background:var(--host-card);border:1px solid var(--host-border);
+  #log{height:200px;overflow-y:auto;background:var(--host-card);border:1px solid var(--host-border);
     border-radius:8px;padding:8px 10px;font-family:ui-monospace,monospace;font-size:11px;
     line-height:1.5;margin-top:6px}
   #log div{white-space:pre-wrap;word-break:break-all}
@@ -285,7 +285,10 @@ async function dfetch(path,opt={}){
     let j=null;const txt=await r.text();try{j=txt?JSON.parse(txt):null}catch(e){}
     if(r.status===429){const w=Math.ceil(((j&&j.retry_after)||1)*1000)+rnd(150,500);
       if(i===retries)return{status:429,body:j,rate:true};await sleep(w);continue}
-    if(r.status===502||r.status===503){await sleep(800);continue}
+    if(r.status===502||r.status===503){
+      if(i===retries)return{status:r.status,body:j,text:txt};
+      await sleep(800);continue;
+    }
     return{status:r.status,body:j,text:txt};
   }
   return{status:0,body:null};
@@ -312,7 +315,8 @@ async function makeMail(){
   const doms=await getDomains();
   if(!doms.length)throw new Error('domain');
   for(let a=0;a<6;a++){
-    const addr=hex(8)+'@'+pick(doms);
+    // Date.now を混ぜて絶対に被らないようにする
+    const addr=hex(8)+Date.now().toString(36)+'@'+pick(doms);
     const pw=hex(12);
     const c=await mailReq('/accounts',{method:'POST',body:JSON.stringify({address:addr,password:pw})});
     if(c.status===429){await sleep(4000);continue}
@@ -343,46 +347,55 @@ async function waitVerifyToken(mail){
 
 /* ---------- register ---------- */
 let sRec=0;
+async function finish(tok,username,mail){
+  if(!mail)return{token:tok,user:username,status:'unverified'};
+  const vt=await waitVerifyToken(mail);
+  if(!vt)return{token:tok,user:username,status:'unverified'};
+  const v=await dfetch('/auth/verify',{method:'POST',token:tok,body:JSON.stringify({token:vt,captcha_key:null})});
+  if(v.body&&v.body.token)tok=v.body.token;
+  return{token:tok,user:username,status:'ok'};
+}
+async function tryLogin(email,password){
+  const r=await dfetch('/auth/login',{method:'POST',retries:1,body:JSON.stringify({
+    login:email,password,undelete:false,captcha_key:null,login_source:null,gift_code_sku_id:null})});
+  if(r.body&&r.body.token)return{token:r.body.token};
+  return{status:r.status,body:r.body};
+}
+
 async function registerOne(){
   const username=pick(ADJ)+pick(NOUN)+rnd(10,9999);
   const password=hex(8)+'Aa1!';
-  let mail=null;
-  if($('#useEmail').checked)mail=await makeMail();
+  let last=null;
 
-  const payload={username,password,email:mail?mail.address:undefined,consent:true,
-    fingerprint:hex(16),captcha_key:null,date_of_birth:'2000-01-01',
-    gift_code_sku_id:null,unique_username_registration:true};
-  const r=await dfetch('/auth/register',{method:'POST',body:JSON.stringify(payload),retries:1});
-  let tok=(r.status===200&&r.body&&r.body.token)?r.body.token:null;
+  for(let attempt=0;attempt<3;attempt++){
+    const mail=$('#useEmail').checked?await makeMail():null;
+    if(mail)log('addr: '+mail.address,'ld');
 
-  // 5xx や「既に登録済み」は作成済みの取りこぼしなので、ログインで回収する
-  if(!tok&&mail){
+    const r=await dfetch('/auth/register',{method:'POST',retries:1,body:JSON.stringify({
+      username,password,email:mail?mail.address:undefined,consent:true,
+      fingerprint:hex(16),captcha_key:null,date_of_birth:'2000-01-01',
+      gift_code_sku_id:null,unique_username_registration:true})});
+
+    if(r.status===200&&r.body&&r.body.token)return await finish(r.body.token,username,mail);
+
     const raw=JSON.stringify(r.body||{});
-    if(/EMAIL_ALREADY_REGISTERED/.test(raw)||r.status>=500){
-      const lg=await dfetch('/auth/login',{method:'POST',body:JSON.stringify({
-        email:mail.address,password,captcha_key:null,gift_code_sku_id:null})});
-      if(lg.body&&lg.body.token){tok=lg.body.token;sRec++;$('#sRec').textContent=sRec;log('回収: '+mail.address,'ld')}
-      else if(/captcha/i.test(JSON.stringify(lg.body||{}))){const e=new Error('login captcha');e.captcha=true;throw e}
-    }
-  }
-
-  if(!tok){
-    const cap=!!(r.body&&r.body.captcha_key);
     let detail=r.text||'';
     if(r.body&&r.body.errors)detail=JSON.stringify(r.body.errors);
     const e=new Error((detail||('HTTP '+r.status)).slice(0,220));
-    e.captcha=cap;throw e;
-  }
+    e.captcha=!!(r.body&&r.body.captcha_key);
+    last=e;
 
-  if(mail){
-    const vt=await waitVerifyToken(mail);
-    if(vt){
-      const v=await dfetch('/auth/verify',{method:'POST',token:tok,body:JSON.stringify({token:vt,captcha_key:null})});
-      if(v.body&&v.body.token)tok=v.body.token;
-    }else return{token:tok,user:username,status:'unverified'};
-    return{token:tok,user:username,status:'ok'};
+    if(e.captcha)throw e;
+    if(r.status<500&&!/EMAIL_ALREADY_REGISTERED/.test(raw))throw e;
+
+    if(/EMAIL_ALREADY_REGISTERED/.test(raw)&&mail){
+      const lg=await tryLogin(mail.address,password);
+      if(lg.token){sRec++;$('#sRec').textContent=sRec;log('回収: '+mail.address,'lg');return await finish(lg.token,username,mail)}
+      log('login失敗 HTTP '+lg.status+' '+JSON.stringify(lg.body||{}).slice(0,120),'ld');
+    }
+    await sleep(1200);
   }
-  return{token:tok,user:username,status:'unverified'};
+  throw last;
 }
 
 let sOk=0,sNg=0,sCap=0;
