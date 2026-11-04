@@ -87,12 +87,12 @@
     <div><label>試行間隔 (ms)</label><input id="genGap" type="number" value="4000" min="0" max="60000"></div>
   </div>
   <div class="chk"><input type="checkbox" id="useEmail" checked><span>メール認証まで自動でやる (mail.tm / プロキシ必須)</span></div>
-  <div class="hint">オフにすると未認証トークンになります。未認証は認証レベル「中」以上のサーバーで発言できません。モバイル回線は IP 共有で 429 が出やすいので同時1・間隔4000以上を推奨。</div>
+  <div class="hint">オフにすると未認証トークンになります。モバイル回線は IP 共有で 429 が出やすいので同時1・間隔4000以上を推奨。</div>
   <div class="btns">
     <button class="btn" id="btnGen">生成開始</button>
     <button class="btn sec" id="btnStop1">停止</button>
   </div>
-  <div class="stat"><div><b id="sOk">0</b>成功</div><div><b id="sNg">0</b>失敗</div><div><b id="sCap">0</b>captcha</div></div>
+  <div class="stat"><div><b id="sOk">0</b>成功</div><div><b id="sNg">0</b>失敗</div><div><b id="sCap">0</b>captcha</div><div><b id="sRec">0</b>回収</div></div>
   <div class="card">
     <div style="display:flex;justify-content:space-between;align-items:center">
       <span style="font-size:12px;font-weight:500">トークン <span id="tokCount" style="color:var(--host-fg-muted)">(0)</span></span>
@@ -312,7 +312,7 @@ async function makeMail(){
   const doms=await getDomains();
   if(!doms.length)throw new Error('domain');
   for(let a=0;a<6;a++){
-    const addr=hex(6)+'@'+pick(doms);
+    const addr=hex(8)+'@'+pick(doms);
     const pw=hex(12);
     const c=await mailReq('/accounts',{method:'POST',body:JSON.stringify({address:addr,password:pw})});
     if(c.status===429){await sleep(4000);continue}
@@ -342,25 +342,38 @@ async function waitVerifyToken(mail){
 }
 
 /* ---------- register ---------- */
+let sRec=0;
 async function registerOne(){
   const username=pick(ADJ)+pick(NOUN)+rnd(10,9999);
-  const password=hex(6)+'Aa1!';
+  const password=hex(8)+'Aa1!';
   let mail=null;
   if($('#useEmail').checked)mail=await makeMail();
-  const r=await dfetch('/auth/register',{method:'POST',body:JSON.stringify({
-    username,password,email:mail?mail.address:undefined,consent:true,
+
+  const payload={username,password,email:mail?mail.address:undefined,consent:true,
     fingerprint:hex(16),captcha_key:null,date_of_birth:'2000-01-01',
-    gift_code_sku_id:null,unique_username_registration:true
-  })});
-  if(r.status!==200){
+    gift_code_sku_id:null,unique_username_registration:true};
+  const r=await dfetch('/auth/register',{method:'POST',body:JSON.stringify(payload),retries:1});
+  let tok=(r.status===200&&r.body&&r.body.token)?r.body.token:null;
+
+  // 5xx や「既に登録済み」は作成済みの取りこぼしなので、ログインで回収する
+  if(!tok&&mail){
+    const raw=JSON.stringify(r.body||{});
+    if(/EMAIL_ALREADY_REGISTERED/.test(raw)||r.status>=500){
+      const lg=await dfetch('/auth/login',{method:'POST',body:JSON.stringify({
+        email:mail.address,password,captcha_key:null,gift_code_sku_id:null})});
+      if(lg.body&&lg.body.token){tok=lg.body.token;sRec++;$('#sRec').textContent=sRec;log('回収: '+mail.address,'ld')}
+      else if(/captcha/i.test(JSON.stringify(lg.body||{}))){const e=new Error('login captcha');e.captcha=true;throw e}
+    }
+  }
+
+  if(!tok){
     const cap=!!(r.body&&r.body.captcha_key);
     let detail=r.text||'';
     if(r.body&&r.body.errors)detail=JSON.stringify(r.body.errors);
     const e=new Error((detail||('HTTP '+r.status)).slice(0,220));
     e.captcha=cap;throw e;
   }
-  let tok=r.body&&r.body.token;
-  if(!tok)throw new Error('no token');
+
   if(mail){
     const vt=await waitVerifyToken(mail);
     if(vt){
