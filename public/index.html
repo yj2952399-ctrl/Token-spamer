@@ -83,11 +83,11 @@
 <div class="panel on" id="p-gen">
   <div class="row">
     <div><label>作るアカウント数</label><input id="genCount" type="number" value="10" min="1" max="500"></div>
-    <div><label>同時実行</label><input id="genConc" type="number" value="2" min="1" max="10"></div>
-    <div><label>試行間隔 (ms)</label><input id="genGap" type="number" value="1500" min="0" max="60000"></div>
+    <div><label>同時実行</label><input id="genConc" type="number" value="1" min="1" max="10"></div>
+    <div><label>試行間隔 (ms)</label><input id="genGap" type="number" value="4000" min="0" max="60000"></div>
   </div>
   <div class="chk"><input type="checkbox" id="useEmail" checked><span>メール認証まで自動でやる (mail.tm / プロキシ必須)</span></div>
-  <div class="hint">オフにすると未認証トークンになります。未認証は認証レベル「中」以上のサーバーで発言できません。</div>
+  <div class="hint">オフにすると未認証トークンになります。未認証は認証レベル「中」以上のサーバーで発言できません。モバイル回線は IP 共有で 429 が出やすいので同時1・間隔4000以上を推奨。</div>
   <div class="btns">
     <button class="btn" id="btnGen">生成開始</button>
     <button class="btn sec" id="btnStop1">停止</button>
@@ -148,7 +148,7 @@
 <div class="panel" id="p-set">
   <label>プロキシエンドポイント</label>
   <input id="proxyUrl" value="/api/proxy" placeholder="/api/proxy">
-  <p class="hint">同一オリジンの Function を既定にしています。空にすると直接 api.discord.com を叩きます。</p>
+  <p class="hint">同一オリジンの Function を既定にしています。リダイレクトで本文が落ちる場合は <code>/.netlify/functions/proxy</code> を直接指定。空にすると直接 api.discord.com を叩きます。</p>
   <label>プロキシ鍵 (Function の PROXY_KEY と一致させる / 任意)</label>
   <input id="proxyKey" placeholder="空なら誰でも使える">
   <label>上流プロキシ (1行1個 / host:port または host:port:user:pass)</label>
@@ -157,7 +157,7 @@
   <div class="chk"><input type="checkbox" id="autoPurge" checked><span>401 のトークンを自動でリストから消す</span></div>
 
   <details>
-    <summary>functions/api/proxy.js のコード (Cloudflare Pages)</summary>
+    <summary>netlify/functions/proxy.js のコード</summary>
     <pre id="workerCode">const ALLOW = ['discord.com', 'discordapp.com', 'api.mail.tm', 'click.discord.com', 'cdn.discordapp.com'];
 const FWD = ['content-type', 'authorization', 'x-super-properties', 'x-discord-locale',
              'x-discord-timezone', 'user-agent', 'proxy-authorization'];
@@ -168,40 +168,46 @@ const cors = {
   'Access-Control-Allow-Methods': 'GET,POST,PUT,PATCH,DELETE,OPTIONS',
 };
 
-export async function onRequest({ request, env }) {
-  if (request.method === 'OPTIONS') return new Response(null, { headers: cors });
+exports.handler = async (event) => {
+  if (event.httpMethod === 'OPTIONS') return { statusCode: 204, headers: cors, body: '' };
 
-  const u = new URL(request.url);
-  const target = u.searchParams.get('url');
-  if (!target) return new Response('missing url', { status: 400, headers: cors });
+  const q = event.queryStringParameters || {};
+  if (!q.url) return { statusCode: 400, headers: cors, body: 'missing url' };
+  if (process.env.PROXY_KEY && q.key !== process.env.PROXY_KEY)
+    return { statusCode: 403, headers: cors, body: 'forbidden' };
 
-  if (env.PROXY_KEY && u.searchParams.get('key') !== env.PROXY_KEY)
-    return new Response('forbidden', { status: 403, headers: cors });
+  const t = new URL(q.url);
+  if (!ALLOW.includes(t.hostname)) return { statusCode: 403, headers: cors, body: 'host not allowed' };
 
-  const t = new URL(target);
-  if (!ALLOW.includes(t.hostname)) return new Response('host not allowed', { status: 403, headers: cors });
+  const headers = {};
+  for (const k of FWD) if (event.headers[k]) headers[k] = event.headers[k];
 
-  const headers = new Headers();
-  for (const k of FWD) {
-    const v = request.headers.get(k);
-    if (v) headers.set(k, v);
-  }
+  const raw = event.body || '';
+  const buf = event.isBase64Encoded ? Buffer.from(raw, 'base64') : Buffer.from(raw, 'utf8');
+  const body = ['GET', 'HEAD'].includes(event.httpMethod) || buf.length === 0 ? undefined : buf;
 
-  let dest = target;
-  const up = request.headers.get('x-upstream-proxy');
+  let dest = q.url;
+  const up = event.headers['x-upstream-proxy'];
   if (up) {
     const [h, p, user, pass] = up.split(':');
     dest = `http://${h}:${p}${t.pathname}${t.search}`;
-    if (user) headers.set('proxy-authorization', 'Basic ' + btoa(`${user}:${pass}`));
+    if (user) headers['proxy-authorization'] = 'Basic ' + Buffer.from(`${user}:${pass}`).toString('base64');
   }
 
-  const body = ['GET', 'HEAD'].includes(request.method) ? null : await request.text();
-  const res = await fetch(dest, { method: request.method, headers, body });
+  const r = await fetch(dest, { method: event.httpMethod, headers, body });
 
-  const out = new Headers(res.headers);
-  Object.entries(cors).forEach(([k, v]) => out.set(k, v));
-  return new Response(res.body, { status: res.status, headers: out });
-}</pre>
+  const out = { ...cors };
+  r.headers.forEach((v, k) => {
+    if (!['content-encoding', 'content-length', 'transfer-encoding'].includes(k)) out[k] = v;
+  });
+
+  return {
+    statusCode: r.status,
+    headers: out,
+    body: Buffer.from(await r.arrayBuffer()).toString('base64'),
+    isBase64Encoded: true,
+  };
+};</pre>
   </details>
 </div>
 
@@ -295,17 +301,26 @@ async function mailReq(path,opt={}){
   const t=await r.text();let j=null;try{j=JSON.parse(t)}catch(e){}
   return{status:r.status,body:j};
 }
-async function makeMail(){
+let mailDomains=null;
+async function getDomains(){
+  if(mailDomains)return mailDomains;
   const d=await mailReq('/domains');
-  const dom=d.body&&d.body['hydra:member']&&d.body['hydra:member'][0];
-  if(!dom)throw new Error('domain');
-  const addr=pick(ADJ)+rnd(100,9999)+'@'+dom.domain;
-  const pw=hex(10);
-  const c=await mailReq('/accounts',{method:'POST',body:JSON.stringify({address:addr,password:pw})});
-  if(c.status!==201)throw new Error('mailacc '+c.status);
-  const tk=await mailReq('/token',{method:'POST',body:JSON.stringify({address:addr,password:pw})});
-  if(!tk.body||!tk.body.token)throw new Error('mailtoken');
-  return{address:addr,token:tk.body.token};
+  mailDomains=((d.body&&d.body['hydra:member'])||[]).map(x=>x.domain);
+  return mailDomains;
+}
+async function makeMail(){
+  const doms=await getDomains();
+  if(!doms.length)throw new Error('domain');
+  for(let a=0;a<6;a++){
+    const addr=hex(6)+'@'+pick(doms);
+    const pw=hex(12);
+    const c=await mailReq('/accounts',{method:'POST',body:JSON.stringify({address:addr,password:pw})});
+    if(c.status===429){await sleep(4000);continue}
+    if(c.status!==201)continue;
+    const tk=await mailReq('/token',{method:'POST',body:JSON.stringify({address:addr,password:pw})});
+    if(tk.body&&tk.body.token)return{address:addr,token:tk.body.token};
+  }
+  throw new Error('mail fail');
 }
 async function waitVerifyToken(mail){
   for(let i=0;i<30;i++){
@@ -339,7 +354,9 @@ async function registerOne(){
   })});
   if(r.status!==200){
     const cap=!!(r.body&&r.body.captcha_key);
-    const e=new Error((r.body&&(r.body.message||r.body.email||r.body.username))||('HTTP '+r.status));
+    let detail=r.text||'';
+    if(r.body&&r.body.errors)detail=JSON.stringify(r.body.errors);
+    const e=new Error((detail||('HTTP '+r.status)).slice(0,220));
     e.captcha=cap;throw e;
   }
   let tok=r.body&&r.body.token;
