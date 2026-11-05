@@ -264,6 +264,9 @@ const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 const rnd=(a,b)=>Math.floor(Math.random()*(b-a+1))+a;
 const pick=a=>a[Math.floor(Math.random()*a.length)];
 function hex(n){const b=new Uint8Array(n);crypto.getRandomValues(b);return [...b].map(x=>x.toString(16).padStart(2,'0')).join('');}
+const ALNUM='abcdefghijklmnopqrstuvwxyz0123456789';
+function randStr(n){const b=new Uint8Array(n);crypto.getRandomValues(b);
+  return [...b].map(x=>ALNUM[x%ALNUM.length]).join('');}
 function nonce(){return Date.now().toString()+rnd(1000,9999);}
 const mask=k=>!k?'(未設定)':k.slice(0,4)+'…'+k.slice(-4)+' ('+k.length+'文字)';
 const localTz=Intl.DateTimeFormat().resolvedOptions().timeZone||'UTC';
@@ -285,6 +288,17 @@ function makeProfile(){
     release_channel:'stable',client_build_number:350000,os_sdk_version:'',
     device_vendor:'',device_model:'',browser_version:'131.0.0.0',browser_user_agent:ua}));
   return{ua,super:sp,locale:'en-US',lang:'en-US,en;q=0.9',tz:localTz,fingerprint:hex(16),country:''};
+}
+
+/* ---------- 資格情報ストア（アドレス被りを即回収するため） ---------- */
+let creds={};
+try{creds=JSON.parse(localStorage.getItem('dts_creds')||'{}')}catch(e){creds={}}
+function saveCred(a,p){
+  if(!a||!p)return;
+  creds[a]=p;
+  const ks=Object.keys(creds);
+  if(ks.length>800)for(const k of ks.slice(0,ks.length-800))delete creds[k];
+  try{localStorage.setItem('dts_creds',JSON.stringify(creds))}catch(e){}
 }
 
 /* ---------- IP 管理 ---------- */
@@ -470,8 +484,6 @@ function needsCaptcha(b){return !!(b&&b.captcha_key&&/captcha-required/.test(JSO
 function capProv(){return $('#capProv').value}
 function hasKey(){return !!$('#capKey').value.trim()}
 
-// チャレンジ本文とレスポンスヘッダの両方から必要値を取り出す。
-// 解答は X-Captcha-Key、rqtoken / session_id は対応ヘッダで返さないと必ず再要求される。
 function capChallenge(r){
   const b=(r&&r.body)||{};
   const hd=r&&r.headers;
@@ -578,9 +590,9 @@ async function getDomains(){
 async function makeMail(){
   const doms=await getDomains();
   if(!doms.length)throw new Error('domain');
-  for(let a=0;a<6;a++){
-    const addr=hex(8)+Date.now().toString(36)+'@'+pick(doms);
-    const pw=hex(12);
+  for(let a=0;a<10;a++){
+    const addr=randStr(20)+'@'+pick(doms);
+    const pw=randStr(14)+'Aa1!';
     const c=await mailReq('/accounts',{method:'POST',body:JSON.stringify({address:addr,password:pw})});
     if(c.status===429){await sleep(4000);continue}
     if(c.status!==201)continue;
@@ -621,8 +633,6 @@ async function finish(tok,username,mail,ip,prof){
 function postRegister(payload,headers,ip,prof){
   return dfetch('/auth/register',{method:'POST',retries:0,ip,prof,body:JSON.stringify(payload),headers});
 }
-
-// 事前に location-metadata を叩いて国・locale を合わせる（登録ページの実クライアントと同じ順序）
 async function preflight(ip,prof){
   if(!$('#preflight').checked)return;
   const r=await dfetch('/auth/location-metadata',{ip,prof,retries:1});
@@ -633,8 +643,6 @@ async function preflight(ip,prof){
     log('locale 合わせ: '+prof.country+' / '+prof.locale,'ld');
   }
 }
-
-// ログインは captcha 要求が返るたびに、そのチャレンジをヘッダごと返して最大3回まで再送する
 async function loginWithCaptcha(email,password,ip,prof){
   const send=async(extra,extraHeaders)=>{
     const body={login:email,password,undelete:false,login_source:null,gift_code_sku_id:null,...(extra||{captcha_key:null})};
@@ -655,7 +663,7 @@ async function loginWithCaptcha(email,password,ip,prof){
 
 async function registerOne(){
   const username=pick(ADJ)+pick(NOUN)+rnd(10,9999);
-  const password=hex(8)+'Aa1!';
+  const password=randStr(12)+'Aa1!';
   const prof=makeProfile();
   const ip=await acquireIp();
   let captchaHit=false;
@@ -663,7 +671,7 @@ async function registerOne(){
   try{
     await preflight(ip,prof);
 
-    for(let attempt=0;attempt<3;attempt++){
+    for(let attempt=0;attempt<4;attempt++){
       const mail=$('#useEmail').checked?await makeMail():null;
       if(mail)log('addr: '+mail.address,'ld');
 
@@ -674,7 +682,6 @@ async function registerOne(){
       let r=await postRegister(payload,null,ip,prof);
       log('reg: '+r.status+' '+(r.text||'').slice(0,160),'ld');
 
-      // captcha 要求は rqdata を添えて解き直す（トークンは使い捨てなので最大2回まで）
       let guard=0;
       while(needsCaptcha(r.body)&&guard<2){
         guard++;captchaHit=true;
@@ -685,9 +692,11 @@ async function registerOne(){
         log('reg(captcha後): '+r.status+' '+(r.text||'').slice(0,160),'ld');
       }
 
-      if(r.status===200&&r.body&&r.body.token)return await finish(r.body.token,username,mail,ip,prof);
+      if(r.status===200&&r.body&&r.body.token){
+        if(mail)saveCred(mail.address,password);
+        return await finish(r.body.token,username,mail,ip,prof);
+      }
 
-      // プロキシが 5xx を返しても Discord 側では作成済みのことがある。まずログインで確認する
       if((r.status===0||r.status>=500)&&mail){
         log('5xx のためログインで確認','ld');
         const probe=await loginWithCaptcha(mail.address,password,ip,prof);
@@ -698,18 +707,18 @@ async function registerOne(){
 
       const raw=JSON.stringify(r.body||{});
       if(/EMAIL_ALREADY_REGISTERED/.test(raw)&&mail){
-        // アドレスは使い捨てなので、まず新しいアドレスで登録をやり直す
-        if(attempt<2){
-          log('既登録 → 新しいアドレスで再試行','ld');
-          last=new Error('EMAIL_ALREADY_REGISTERED');
-          await sleep(800);
-          continue;
+        // アドレス被り。保存済みパスワードがあればログイン、無ければ即振り直し。
+        const known=creds[mail.address];
+        if(known){
+          log('既登録 + 保存済みパスワード → ログイン','ld');
+          const lg=await loginWithCaptcha(mail.address,known,ip,prof);
+          if(lg.token){sRec++;$('#sRec').textContent=sRec;log('回収: '+mail.address,'lg');return await finish(lg.token,username,mail,ip,prof)}
+          log('login失敗 → 即振り直し','ld');
+        }else{
+          log('既登録 (パスワード不明) → 即振り直し','ld');
         }
-        log('既登録 → ログインで回収','ld');
-        const lg=await loginWithCaptcha(mail.address,password,ip,prof);
-        if(lg.token){sRec++;$('#sRec').textContent=sRec;log('回収: '+mail.address,'lg');return await finish(lg.token,username,mail,ip,prof)}
-        log('login失敗 HTTP '+lg.status+' '+JSON.stringify(lg.body||{}).slice(0,180),'ld');
-        last=new Error('login失敗 HTTP '+lg.status);
+        last=new Error('EMAIL_ALREADY_REGISTERED');
+        if(attempt<3)continue;
       }else{
         const detail=(r.body&&r.body.errors)?JSON.stringify(r.body.errors):(r.text||('HTTP '+r.status));
         last=new Error(detail.slice(0,220));
@@ -731,8 +740,6 @@ async function runGen(){
   if(!proxyEndpoint()&&$('#useEmail').checked){log('プロキシ未設定: メール作成が CORS で失敗します','lw')}
   if(!hasKey())log('captcha キー未設定: captcha で止まります','lw');
   if(!$('#proxyOn').checked)log('上流プロキシ未使用: captcha を回避できません（IP が毎回変わります）','lw');
-  else if(proxyList().length<Math.ceil(total/Math.max(1,+$('#ipMax').value||1)))
-    log('IP 数が足りません。'+proxyList().length+' IP では待機が発生します','lw');
   let started=0,done=0;
   const worker=async()=>{
     while(!stopped&&started<total){
@@ -907,8 +914,6 @@ $('#capKey').addEventListener('change',()=>{
 });
 $('#capProv').addEventListener('change',()=>log('captcha サービス変更: '+capProv()+' / キー '+mask($('#capKey').value.trim()),'ld'));
 $('#capUseProxy').addEventListener('change',()=>log('captcha のプロキシ使用: '+($('#capUseProxy').checked?'ON':'OFF'),'ld'));
-$('#ipMax').addEventListener('change',()=>log('1 IP あたり最大: '+$('#ipMax').value,'ld'));
-$('#ipCool').addEventListener('change',()=>log('IP クールダウン: '+$('#ipCool').value+'分','ld'));
 
 function syncWarn(){$('#keyWarn').style.display=hasKey()?'none':'block'}
 syncWarn();
