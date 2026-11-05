@@ -182,12 +182,14 @@
     <pre id="workerCode">const ALLOW = ['discord.com', 'discordapp.com', 'api.mail.tm', 'click.discord.com',
                'cdn.discordapp.com', '2captcha.com', 'api.yescaptcha.com'];
 const FWD = ['content-type', 'authorization', 'x-super-properties', 'x-discord-locale',
-             'x-discord-timezone', 'user-agent', 'proxy-authorization'];
+             'x-discord-timezone', 'user-agent', 'proxy-authorization', 'x-upstream-proxy',
+             'x-captcha-key', 'x-captcha-rqtoken', 'x-captcha-session-id', 'x-captcha-rqdata'];
 
 const cors = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Headers': '*',
   'Access-Control-Allow-Methods': 'GET,POST,PUT,PATCH,DELETE,OPTIONS',
+  'Access-Control-Expose-Headers': '*',
 };
 
 exports.handler = async (event) => {
@@ -300,10 +302,10 @@ async function ext(target,opt={}){
   const url=withKey(ep+(ep.includes('?')?'&':'?')+'url='+encodeURIComponent(target));
   const r=await fetch(url,{method:opt.method||'GET',headers:{'Content-Type':opt.ctype||'application/json'},body:opt.body});
   const t=await r.text();let j=null;try{j=JSON.parse(t)}catch(e){}
-  return{status:r.status,body:j,text:t};
+  return{status:r.status,body:j,text:t,headers:r.headers};
 }
 async function dfetch(path,opt={}){
-  const {token,method='GET',body,retries=3}=opt;
+  const {token,method='GET',body,retries=3,headers:extra}=opt;
   const ep=proxyEndpoint();
   const target=API+path;
   const up=pickUpstream();
@@ -312,18 +314,19 @@ async function dfetch(path,opt={}){
   const h={'Content-Type':'application/json','X-Super-Properties':SUPER,'X-Discord-Locale':'en-US','X-Discord-Timezone':'Asia/Tokyo'};
   if(token)h.Authorization=token;
   if(up)h['X-Upstream-Proxy']=up;
+  if(extra)for(const k in extra)if(extra[k]!=null)h[k]=extra[k];
   for(let i=0;i<=retries;i++){
     let r;
     try{r=await fetch(url,{method,headers:h,body:method==='GET'?undefined:body});}
     catch(e){if(i===retries)throw new Error('network');await sleep(1000*(i+1));continue}
     let j=null;const txt=await r.text();try{j=txt?JSON.parse(txt):null}catch(e){}
     if(r.status===429){const w=Math.ceil(((j&&j.retry_after)||1)*1000)+rnd(150,500);
-      if(i===retries)return{status:429,body:j,rate:true};await sleep(w);continue}
+      if(i===retries)return{status:429,body:j,rate:true,headers:r.headers};await sleep(w);continue}
     if(r.status===502||r.status===503){
-      if(i===retries)return{status:r.status,body:j,text:txt};
+      if(i===retries)return{status:r.status,body:j,text:txt,headers:r.headers};
       await sleep(800);continue;
     }
-    return{status:r.status,body:j,text:txt};
+    return{status:r.status,body:j,text:txt,headers:r.headers};
   }
   return{status:0,body:null};
 }
@@ -374,27 +377,53 @@ function needsCaptcha(b){return !!(b&&b.captcha_key&&/captcha-required/.test(JSO
 function capProv(){return $('#capProv').value}
 function hasKey(){return !!$('#capKey').value.trim()}
 
-// Discord は captcha_key に加えて rqdata / rqtoken を返してくる。これを送り返さないと必ず再要求される
-function capFields(b, token){
+// チャレンジ本文とレスポンスヘッダの両方から必要値を取り出す。
+// 解答は X-Captcha-Key、rqtoken / session_id は対応ヘッダで返さないと必ず再要求される。
+function capChallenge(r){
+  const b=(r&&r.body)||{};
+  const hd=r&&r.headers;
+  const fromHdr=k=>{try{return (hd&&hd.get&&hd.get('x-'+k.replace(/_/g,'-')))||''}catch(e){return ''}};
+  return{
+    sitekey:b.captcha_sitekey||'',
+    rqdata:b.captcha_rqdata||fromHdr('captcha_rqdata'),
+    rqtoken:b.captcha_rqtoken||fromHdr('captcha_rqtoken'),
+    sessionId:b.captcha_session_id||fromHdr('captcha_session_id'),
+    invisible:!!b.should_serve_invisible
+  };
+}
+function capFields(c, token){
   const o={captcha_key:token||null};
-  if(b&&b.captcha_rqdata)o.captcha_rqdata=b.captcha_rqdata;
-  if(b&&b.captcha_rqtoken)o.captcha_rqtoken=b.captcha_rqtoken;
+  if(c.rqdata)o.captcha_rqdata=c.rqdata;
+  if(c.rqtoken)o.captcha_rqtoken=c.rqtoken;
+  if(c.sessionId)o.captcha_session_id=c.sessionId;
   return o;
 }
+function capHeaders(c, token){
+  const h={};
+  if(token)h['X-Captcha-Key']=token;
+  if(c.rqtoken)h['X-Captcha-Rqtoken']=c.rqtoken;
+  if(c.sessionId)h['X-Captcha-Session-Id']=c.sessionId;
+  if(c.rqdata)h['X-Captcha-Rqdata']=c.rqdata;
+  return h;
+}
 
-async function solveCaptcha(req,pageurl){
-  const sitekey=typeof req==='string'?req:(req&&req.captcha_sitekey);
-  const rqdata=(req&&req.captcha_rqdata)||'';
+async function solveCaptcha(ch,pageurl){
+  const c=typeof ch==='string'?{sitekey:ch}:（ch||{});
+  const sitekey=c.sitekey;
+  const rqdata=c.rqdata||'';
   const key=$('#capKey').value.trim();
   if(!key)throw new Error('captcha 要求 / APIキー未設定');
+  if(!sitekey)throw new Error('captcha sitekey が取れません');
   const prov=capProv();
   const up=$('#capUseProxy').checked?pickUpstream():null;
   log('captcha 解決中… ('+prov+(up?' / 自前プロキシ':' / proxyless')+' / '+mask(key)+')','lw');
 
   if(prov==='yescaptcha'){
     const BASE='https://api.yescaptcha.com';
-    const task={type:up?'HCaptchaTask':'HCaptchaTaskProxyless',websiteURL:pageurl,websiteKey:sitekey};
-    if(rqdata)task.rqdata=rqdata;
+    const task={type:up?'HCaptchaTask':'HCaptchaTaskProxyless',websiteURL:pageurl,websiteKey:sitekey,
+      userAgent:navigator.userAgent};
+    if(rqdata){task.rqdata=rqdata;task.isEnterprise=true}
+    if(c.invisible)task.isInvisible=true;
     if(up){
       const p=parseProxy(up);
       task.proxyType='http';task.proxyAddress=p.h;task.proxyPort=+p.port;
@@ -416,7 +445,7 @@ async function solveCaptcha(req,pageurl){
     throw new Error('solver timeout');
   }
 
-  const fd=new URLSearchParams({key,method:'hcaptcha',sitekey,pageurl,json:'1'});
+  const fd=new URLSearchParams({key,method:'hcaptcha',sitekey,pageurl,json:'1',userAgent:navigator.userAgent});
   if(rqdata){fd.set('enterprise','1');fd.set('data',rqdata)}
   if(up){
     const p=parseProxy(up);
@@ -496,22 +525,22 @@ async function finish(tok,username,mail){
   if(v.body&&v.body.token)tok=v.body.token;
   return{token:tok,user:username,status:'ok'};
 }
-function postRegister(payload){
-  return dfetch('/auth/register',{method:'POST',retries:0,body:JSON.stringify(payload)});
+function postRegister(payload,headers){
+  return dfetch('/auth/register',{method:'POST',retries:0,body:JSON.stringify(payload),headers});
 }
 
-// ログインは captcha 要求が返るたびに解き直して最大3回まで再送する
+// ログインは captcha 要求が返るたびに、そのチャレンジをヘッダごと返して最大3回まで再送する
 async function loginWithCaptcha(email,password){
-  const send=async(extra)=>{
+  const send=async(extra,extraHeaders)=>{
     const body={login:email,password,undelete:false,login_source:null,gift_code_sku_id:null,...(extra||{captcha_key:null})};
-    return dfetch('/auth/login',{method:'POST',retries:1,body:JSON.stringify(body)});
+    return dfetch('/auth/login',{method:'POST',retries:1,body:JSON.stringify(body),headers:extraHeaders});
   };
-  let r=await send(null);
+  let r=await send(null,null);
   for(let i=0;i<3&&needsCaptcha(r.body);i++){
-    const b=r.body;
-    log('login captcha 要求 (rqdata '+(b.captcha_rqdata?'あり':'なし')+')','lw');
-    const cap=await solveCaptcha(b,'https://discord.com/login');
-    r=await send(capFields(b,cap));
+    const c=capChallenge(r);
+    log('login captcha 要求 (rqdata:'+(c.rqdata?'有':'無')+' rqtoken:'+(c.rqtoken?'有':'無')+' sid:'+(c.sessionId?'有':'無')+')','lw');
+    const cap=await solveCaptcha(c,'https://discord.com/login');
+    r=await send(capFields(c,cap),capHeaders(c,cap));
     log('login(captcha後): '+r.status+' '+(r.text||'').slice(0,160),'ld');
     if(r.body&&r.body.token)break;
   }
@@ -532,17 +561,17 @@ async function registerOne(){
       fingerprint:hex(16),captcha_key:null,date_of_birth:'2000-01-01',
       gift_code_sku_id:null,unique_username_registration:true};
 
-    let r=await postRegister(payload);
+    let r=await postRegister(payload,null);
     log('reg: '+r.status+' '+(r.text||'').slice(0,160),'ld');
 
     // captcha 要求は rqdata を添えて解き直す（トークンは使い捨てなので最大2回まで）
     let guard=0;
     while(needsCaptcha(r.body)&&guard<2){
       guard++;
-      const b=r.body;
-      log('reg captcha 要求 (rqdata '+(b.captcha_rqdata?'あり':'なし')+')','lw');
-      const cap=await solveCaptcha(b,'https://discord.com/register');
-      r=await postRegister({...payload,...capFields(b,cap)});
+      const c=capChallenge(r);
+      log('reg captcha 要求 (rqdata:'+(c.rqdata?'有':'無')+' rqtoken:'+(c.rqtoken?'有':'無')+' sid:'+(c.sessionId?'有':'無')+')','lw');
+      const cap=await solveCaptcha(c,'https://discord.com/register');
+      r=await postRegister({...payload,...capFields(c,cap)},capHeaders(c,cap));
       log('reg(captcha後): '+r.status+' '+(r.text||'').slice(0,160),'ld');
     }
 
@@ -559,6 +588,13 @@ async function registerOne(){
 
     const raw=JSON.stringify(r.body||{});
     if(/EMAIL_ALREADY_REGISTERED/.test(raw)&&mail){
+      // アドレスは使い捨てなので、まず新しいアドレスで登録をやり直す
+      if(attempt<2){
+        log('既登録 → 新しいアドレスで再試行','ld');
+        last=new Error('EMAIL_ALREADY_REGISTERED');
+        await sleep(800);
+        continue;
+      }
       log('既登録 → ログインで回収','ld');
       const lg=await loginWithCaptcha(mail.address,password);
       if(lg.token){sRec++;$('#sRec').textContent=sRec;log('回収: '+mail.address,'lg');return await finish(lg.token,username,mail)}
@@ -581,6 +617,7 @@ async function runGen(){
   const total=+$('#genCount').value,conc=+$('#genConc').value,gap=+$('#genGap').value;
   if(!proxyEndpoint()&&$('#useEmail').checked){log('プロキシ未設定: メール作成が CORS で失敗します','lw')}
   if(!hasKey())log('captcha キー未設定: captcha で止まります','lw');
+  if(proxyEndpoint()&&!$('#proxyOn').checked)log('上流プロキシ未使用: captcha の解答が IP 不一致で弾かれやすいです','lw');
   let started=0,done=0;
   const worker=async()=>{
     while(!stopped&&started<total){
