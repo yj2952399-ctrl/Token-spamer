@@ -408,7 +408,7 @@ function capHeaders(c, token){
 }
 
 async function solveCaptcha(ch,pageurl){
-  const c=typeof ch==='string'?{sitekey:ch}:（ch||{});
+  const c=typeof ch==='string'?{sitekey:ch}:(ch||{});
   const sitekey=c.sitekey;
   const rqdata=c.rqdata||'';
   const key=$('#capKey').value.trim();
@@ -762,11 +762,13 @@ async function runSpam(){
 }
 
 /* ---------- wiring ---------- */
-document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>{
+document.querySelectorAll('.tab').forEach(b=>b.addEventListener('click',()=>{
   document.querySelectorAll('.tab').forEach(x=>x.classList.remove('on'));
   document.querySelectorAll('.panel').forEach(x=>x.classList.remove('on'));
-  b.classList.add('on');$('#p-'+b.dataset.t).classList.add('on');
-});
+  b.classList.add('on');
+  const p=document.getElementById('p-'+b.dataset.t);
+  if(p)p.classList.add('on');
+}));
 $('#btnGen').onclick=()=>{$('#btnGen').disabled=true;runGen().finally(()=>$('#btnGen').disabled=false)};
 $('#btnJoin').onclick=()=>{$('#btnJoin').disabled=true;runJoin().finally(()=>$('#btnJoin').disabled=false)};
 $('#btnSpam').onclick=()=>{$('#btnSpam').disabled=true;runSpam().finally(()=>$('#btnSpam').disabled=false)};
