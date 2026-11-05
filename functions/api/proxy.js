@@ -1,7 +1,8 @@
 const ALLOW = ['discord.com', 'discordapp.com', 'api.mail.tm', 'click.discord.com',
                'cdn.discordapp.com', '2captcha.com', 'api.yescaptcha.com'];
 const FWD = ['content-type', 'authorization', 'x-super-properties', 'x-discord-locale',
-             'x-discord-timezone', 'user-agent', 'proxy-authorization', 'x-upstream-proxy',
+             'x-discord-timezone', 'user-agent', 'accept', 'accept-language',
+             'proxy-authorization', 'x-upstream-proxy', 'x-discord-cookie',
              'x-captcha-key', 'x-captcha-rqtoken', 'x-captcha-session-id', 'x-captcha-rqdata'];
 
 const cors = {
@@ -29,6 +30,8 @@ export async function onRequest({ request, env }) {
     const v = request.headers.get(k);
     if (v) headers.set(k, v);
   }
+  const ck = headers.get('x-discord-cookie');
+  if (ck) headers.set('cookie', ck);
 
   let dest = target;
   const up = request.headers.get('x-upstream-proxy');
