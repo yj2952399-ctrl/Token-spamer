@@ -1,4 +1,5 @@
-const ALLOW = ['discord.com', 'discordapp.com', 'api.mail.tm', 'click.discord.com', 'cdn.discordapp.com'];
+const ALLOW = ['discord.com', 'discordapp.com', 'api.mail.tm', 'click.discord.com',
+               'cdn.discordapp.com', '2captcha.com', 'api.yescaptcha.com'];
 const FWD = ['content-type', 'authorization', 'x-super-properties', 'x-discord-locale',
              'x-discord-timezone', 'user-agent', 'proxy-authorization'];
 
