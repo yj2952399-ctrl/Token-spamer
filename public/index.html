@@ -87,15 +87,15 @@
   <div class="row">
     <div><label>作るアカウント数</label><input id="genCount" type="number" value="10" min="1" max="500"></div>
     <div><label>同時実行</label><input id="genConc" type="number" value="1" min="1" max="10"></div>
-    <div><label>試行間隔 (ms)</label><input id="genGap" type="number" value="4000" min="0" max="60000"></div>
+    <div><label>試行間隔 (ms)</label><input id="genGap" type="number" value="9000" min="0" max="60000"></div>
   </div>
   <div class="chk"><input type="checkbox" id="useEmail" checked><span>メール認証まで自動でやる (mail.tm / プロキシ必須)</span></div>
-  <div class="hint">オフにすると未認証トークンになります。モバイル回線は IP 共有で 429 が出やすいので同時1・間隔4000以上を推奨。</div>
+  <div class="hint">オフにすると未認証トークンになります。captcha を出さないコツは「1 IP 1 アカウント・間隔 9 秒以上・同時 1」。</div>
   <div class="btns">
     <button class="btn" id="btnGen">生成開始</button>
     <button class="btn sec" id="btnStop1">停止</button>
   </div>
-  <div class="stat"><div><b id="sOk">0</b>成功</div><div><b id="sNg">0</b>失敗</div><div><b id="sCap">0</b>captcha</div><div><b id="sRec">0</b>回収</div></div>
+  <div class="stat"><div><b id="sOk">0</b>成功</div><div><b id="sNg">0</b>失敗</div><div><b id="sCap">0</b>captcha</div><div><b id="sRec">0</b>回収</div><div><b id="sIp">0</b>IP待ち</div></div>
 
   <div class="card">
     <div style="font-size:12px;font-weight:500">外部で取得したトークンを使う（生成をスキップ）</div>
@@ -167,6 +167,17 @@
   <input id="capKey" placeholder="各サービスの API キー / clientKey">
   <p class="hint">captcha が出たときだけ使います。2captcha は hCaptcha 1件 約 $0.001〜0.003、10〜30秒。YesCaptcha は 1件30ポイント。入力・変更するとログに残ります。</p>
   <div class="chk"><input type="checkbox" id="capUseProxy"><span>captcha も上流プロキシ経由で解く（IP を揃える / 通過率が上がる・料金は半額）</span></div>
+
+  <h3>captcha 回避</h3>
+  <div class="chk"><input type="checkbox" id="stickyIp" checked><span>プロキシをアカウントごとに固定する（登録とログインを同じ IP で行う）</span></div>
+  <div class="row">
+    <div><label>1 IP あたりの最大アカウント数</label><input id="ipMax" type="number" value="1" min="1" max="50"></div>
+    <div><label>IP クールダウン (分)</label><input id="ipCool" type="number" value="15" min="0" max="1440"></div>
+  </div>
+  <div class="chk"><input type="checkbox" id="preflight" checked><span>事前に location-metadata を取得して locale / 国コードを合わせる</span></div>
+  <div class="chk"><input type="checkbox" id="fpSpoof" checked><span>UA / super properties / fingerprint を 1 プロファイルに統一する</span></div>
+  <div class="hint">1 IP 1 アカウント + 15 分クールダウンが最も captcha を出しません。IP 数が足りないときは最大数を 2〜3 に上げ、間隔を延ばしてください。</div>
+
   <label>プロキシエンドポイント</label>
   <input id="proxyUrl" value="/api/proxy" placeholder="/api/proxy">
   <p class="hint">同一オリジンの Function を既定にしています。リダイレクトで本文が落ちる場合は <code>/.netlify/functions/proxy</code> を直接指定。空にすると直接 api.discord.com を叩きます。</p>
@@ -182,7 +193,8 @@
     <pre id="workerCode">const ALLOW = ['discord.com', 'discordapp.com', 'api.mail.tm', 'click.discord.com',
                'cdn.discordapp.com', '2captcha.com', 'api.yescaptcha.com'];
 const FWD = ['content-type', 'authorization', 'x-super-properties', 'x-discord-locale',
-             'x-discord-timezone', 'user-agent', 'proxy-authorization', 'x-upstream-proxy',
+             'x-discord-timezone', 'user-agent', 'accept', 'accept-language',
+             'proxy-authorization', 'x-upstream-proxy', 'x-discord-cookie',
              'x-captcha-key', 'x-captcha-rqtoken', 'x-captcha-session-id', 'x-captcha-rqdata'];
 
 const cors = {
@@ -205,6 +217,7 @@ exports.handler = async (event) => {
 
   const headers = {};
   for (const k of FWD) if (event.headers[k]) headers[k] = event.headers[k];
+  if (headers['x-discord-cookie']) headers.cookie = headers['x-discord-cookie'];
 
   const raw = event.body || '';
   const buf = event.isBase64Encoded ? Buffer.from(raw, 'base64') : Buffer.from(raw, 'utf8');
@@ -253,10 +266,82 @@ const pick=a=>a[Math.floor(Math.random()*a.length)];
 function hex(n){const b=new Uint8Array(n);crypto.getRandomValues(b);return [...b].map(x=>x.toString(16).padStart(2,'0')).join('');}
 function nonce(){return Date.now().toString()+rnd(1000,9999);}
 const mask=k=>!k?'(未設定)':k.slice(0,4)+'…'+k.slice(-4)+' ('+k.length+'文字)';
+const localTz=Intl.DateTimeFormat().resolvedOptions().timeZone||'UTC';
 
 const SUPER=btoa(JSON.stringify({os:'Android',browser:'Discord Android',device:'',system_locale:'en-US',
   client_version:'263.0',release_channel:'googleRelease',device_vendor:'google',device_model:'Pixel 8',
   os_version:'34',client_build_number:263000,os_sdk_version:'34',device_manufacturer:'Google'}));
+
+const UAS=[
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+];
+function makeProfile(){
+  const ua=pick(UAS);
+  const win=ua.includes('Windows');
+  const sp=btoa(JSON.stringify({os:win?'Windows':'Mac OS X',browser:'Chrome',device:'',
+    system_locale:'en-US',client_version:'0.0.0',os_version:win?'10':'10.15.7',
+    release_channel:'stable',client_build_number:350000,os_sdk_version:'',
+    device_vendor:'',device_model:'',browser_version:'131.0.0.0',browser_user_agent:ua}));
+  return{ua,super:sp,locale:'en-US',lang:'en-US,en;q=0.9',tz:localTz,fingerprint:hex(16),country:''};
+}
+
+/* ---------- IP 管理 ---------- */
+const ipState=new Map();
+function ipKey(p){return p||'__direct__'}
+function seedCookies(){
+  return '__dcfduid='+hex(16)+'; __sdcfduid='+hex(16)+hex(16)+
+         '; _cfuvid='+hex(16)+'-'+Date.now()+'-0.0.1.1-604800000';
+}
+function stateOf(k){
+  if(!ipState.has(k))ipState.set(k,{used:0,until:0,jar:seedCookies()});
+  const s=ipState.get(k);
+  if(s.used>=Math.max(1,+$('#ipMax').value||1)&&Date.now()>s.until)s.used=0;
+  return s;
+}
+function mergeCookies(ip,sc){
+  if(!sc)return;
+  const s=stateOf(ipKey(ip));
+  const map=new Map(s.jar.split('; ').filter(Boolean).map(p=>{const i=p.indexOf('=');return[p.slice(0,i),p.slice(i+1)]}));
+  for(const part of sc.split(/,(?=[^;]+=)/)){
+    const kv=(part||'').split(';')[0];const i=kv.indexOf('=');if(i<0)continue;
+    const n=kv.slice(0,i).trim(),v=kv.slice(i+1).trim();
+    if(/^_/.test(n))map.set(n,v);
+  }
+  s.jar=[...map].map(([k,v])=>k+'='+v).join('; ');
+}
+function ipFor(opt){
+  if(!$('#proxyOn').checked)return null;
+  if($('#stickyIp').checked&&opt.ip!==undefined)return opt.ip;
+  return pickUpstream();
+}
+async function acquireIp(){
+  const list=proxyList();
+  if(!$('#proxyOn').checked||!list.length)return null;
+  const maxPer=Math.max(1,+$('#ipMax').value||1);
+  for(let g=0;g<900;g++){
+    if(stopped)return pick(list);
+    const cands=list.filter(p=>{const s=stateOf(ipKey(p));return s.used<maxPer&&Date.now()>=s.until});
+    if(cands.length)return pick(cands);
+    const waits=list.map(p=>stateOf(ipKey(p)).until-Date.now()).filter(x=>x>0);
+    const w=waits.length?Math.min(...waits):1500;
+    $('#sIp').textContent=+$('#sIp').textContent+1;
+    log('IP 枯渇 → '+Math.ceil(w/1000)+'s 待機','ld');
+    await sleep(Math.min(w+300,20000));
+  }
+  return pick(list);
+}
+function releaseIp(ip,captcha){
+  if(!ip)return;
+  const s=stateOf(ipKey(ip));
+  if(captcha){s.until=Date.now()+Math.max(60000,(+$('#ipCool').value||0)*60000);s.used=0;return}
+  s.used++;
+  if(s.used>=Math.max(1,+$('#ipMax').value||1)){
+    s.until=Date.now()+(+$('#ipCool').value||0)*60000;
+    s.used=0;
+  }
+}
 
 let tokens=[];
 try{tokens=JSON.parse(localStorage.getItem('dts_tokens')||'[]');}catch(e){tokens=[]}
@@ -288,9 +373,10 @@ function syncSelect(){
 function proxyEndpoint(){return $('#proxyUrl').value.trim()}
 function proxyKey(){return $('#proxyKey').value.trim()}
 function withKey(u){const k=proxyKey();return k?u+(u.includes('?')?'&':'?')+'key='+encodeURIComponent(k):u}
+function proxyList(){return $('#proxyList').value.split('\n').map(x=>x.trim()).filter(Boolean)}
 function pickUpstream(){
   if(!$('#proxyOn').checked)return null;
-  const l=$('#proxyList').value.split('\n').map(x=>x.trim()).filter(Boolean);
+  const l=proxyList();
   return l.length?pick(l):null;
 }
 function parseProxy(p){
@@ -308,10 +394,16 @@ async function dfetch(path,opt={}){
   const {token,method='GET',body,retries=3,headers:extra}=opt;
   const ep=proxyEndpoint();
   const target=API+path;
-  const up=pickUpstream();
+  const up=ipFor(opt);
+  const prof=$('#fpSpoof').checked?opt.prof:null;
   let url=target;
   if(ep)url=withKey(ep+(ep.includes('?')?'&':'?')+'url='+encodeURIComponent(target));
-  const h={'Content-Type':'application/json','X-Super-Properties':SUPER,'X-Discord-Locale':'en-US','X-Discord-Timezone':'Asia/Tokyo'};
+  const h={'Content-Type':'application/json','Accept':'*/*',
+    'X-Super-Properties':prof?prof.super:SUPER,
+    'X-Discord-Locale':prof?prof.locale:'en-US',
+    'X-Discord-Timezone':prof?prof.tz:localTz};
+  if(prof){h['User-Agent']=prof.ua;h['Accept-Language']=prof.lang}
+  if(ep)h['X-Discord-Cookie']=stateOf(ipKey(up)).jar;
   if(token)h.Authorization=token;
   if(up)h['X-Upstream-Proxy']=up;
   if(extra)for(const k in extra)if(extra[k]!=null)h[k]=extra[k];
@@ -319,6 +411,7 @@ async function dfetch(path,opt={}){
     let r;
     try{r=await fetch(url,{method,headers:h,body:method==='GET'?undefined:body});}
     catch(e){if(i===retries)throw new Error('network');await sleep(1000*(i+1));continue}
+    mergeCookies(up,r.headers.get('set-cookie'));
     let j=null;const txt=await r.text();try{j=txt?JSON.parse(txt):null}catch(e){}
     if(r.status===429){const w=Math.ceil(((j&&j.retry_after)||1)*1000)+rnd(150,500);
       if(i===retries)return{status:429,body:j,rate:true,headers:r.headers};await sleep(w);continue}
@@ -407,7 +500,7 @@ function capHeaders(c, token){
   return h;
 }
 
-async function solveCaptcha(ch,pageurl){
+async function solveCaptcha(ch,pageurl,ip,prof){
   const c=typeof ch==='string'?{sitekey:ch}:(ch||{});
   const sitekey=c.sitekey;
   const rqdata=c.rqdata||'';
@@ -415,13 +508,13 @@ async function solveCaptcha(ch,pageurl){
   if(!key)throw new Error('captcha 要求 / APIキー未設定');
   if(!sitekey)throw new Error('captcha sitekey が取れません');
   const prov=capProv();
-  const up=$('#capUseProxy').checked?pickUpstream():null;
+  const up=$('#capUseProxy').checked?(ip||pickUpstream()):null;
+  const ua=(prof&&prof.ua)||navigator.userAgent;
   log('captcha 解決中… ('+prov+(up?' / 自前プロキシ':' / proxyless')+' / '+mask(key)+')','lw');
 
   if(prov==='yescaptcha'){
     const BASE='https://api.yescaptcha.com';
-    const task={type:up?'HCaptchaTask':'HCaptchaTaskProxyless',websiteURL:pageurl,websiteKey:sitekey,
-      userAgent:navigator.userAgent};
+    const task={type:up?'HCaptchaTask':'HCaptchaTaskProxyless',websiteURL:pageurl,websiteKey:sitekey,userAgent:ua};
     if(rqdata){task.rqdata=rqdata;task.isEnterprise=true}
     if(c.invisible)task.isInvisible=true;
     if(up){
@@ -445,7 +538,7 @@ async function solveCaptcha(ch,pageurl){
     throw new Error('solver timeout');
   }
 
-  const fd=new URLSearchParams({key,method:'hcaptcha',sitekey,pageurl,json:'1',userAgent:navigator.userAgent});
+  const fd=new URLSearchParams({key,method:'hcaptcha',sitekey,pageurl,json:'1',userAgent:ua});
   if(rqdata){fd.set('enterprise','1');fd.set('data',rqdata)}
   if(up){
     const p=parseProxy(up);
@@ -517,29 +610,41 @@ async function waitVerifyToken(mail){
 
 /* ---------- register ---------- */
 let sRec=0;
-async function finish(tok,username,mail){
+async function finish(tok,username,mail,ip,prof){
   if(!mail)return{token:tok,user:username,status:'unverified'};
   const vt=await waitVerifyToken(mail);
   if(!vt)return{token:tok,user:username,status:'unverified'};
-  const v=await dfetch('/auth/verify',{method:'POST',token:tok,body:JSON.stringify({token:vt,captcha_key:null})});
+  const v=await dfetch('/auth/verify',{method:'POST',token:tok,ip,prof,body:JSON.stringify({token:vt,captcha_key:null})});
   if(v.body&&v.body.token)tok=v.body.token;
   return{token:tok,user:username,status:'ok'};
 }
-function postRegister(payload,headers){
-  return dfetch('/auth/register',{method:'POST',retries:0,body:JSON.stringify(payload),headers});
+function postRegister(payload,headers,ip,prof){
+  return dfetch('/auth/register',{method:'POST',retries:0,ip,prof,body:JSON.stringify(payload),headers});
+}
+
+// 事前に location-metadata を叩いて国・locale を合わせる（登録ページの実クライアントと同じ順序）
+async function preflight(ip,prof){
+  if(!$('#preflight').checked)return;
+  const r=await dfetch('/auth/location-metadata',{ip,prof,retries:1});
+  if(r.body&&r.body.country_code){
+    prof.country=r.body.country_code;
+    prof.locale=r.body.country_code==='JP'?'ja':'en-US';
+    prof.lang=prof.locale+',en;q=0.9';
+    log('locale 合わせ: '+prof.country+' / '+prof.locale,'ld');
+  }
 }
 
 // ログインは captcha 要求が返るたびに、そのチャレンジをヘッダごと返して最大3回まで再送する
-async function loginWithCaptcha(email,password){
+async function loginWithCaptcha(email,password,ip,prof){
   const send=async(extra,extraHeaders)=>{
     const body={login:email,password,undelete:false,login_source:null,gift_code_sku_id:null,...(extra||{captcha_key:null})};
-    return dfetch('/auth/login',{method:'POST',retries:1,body:JSON.stringify(body),headers:extraHeaders});
+    return dfetch('/auth/login',{method:'POST',retries:1,ip,prof,body:JSON.stringify(body),headers:extraHeaders});
   };
   let r=await send(null,null);
   for(let i=0;i<3&&needsCaptcha(r.body);i++){
     const c=capChallenge(r);
     log('login captcha 要求 (rqdata:'+(c.rqdata?'有':'無')+' rqtoken:'+(c.rqtoken?'有':'無')+' sid:'+(c.sessionId?'有':'無')+')','lw');
-    const cap=await solveCaptcha(c,'https://discord.com/login');
+    const cap=await solveCaptcha(c,'https://discord.com/login',ip,prof);
     r=await send(capFields(c,cap),capHeaders(c,cap));
     log('login(captcha後): '+r.status+' '+(r.text||'').slice(0,160),'ld');
     if(r.body&&r.body.token)break;
@@ -551,64 +656,72 @@ async function loginWithCaptcha(email,password){
 async function registerOne(){
   const username=pick(ADJ)+pick(NOUN)+rnd(10,9999);
   const password=hex(8)+'Aa1!';
+  const prof=makeProfile();
+  const ip=await acquireIp();
+  let captchaHit=false;
   let last=null;
+  try{
+    await preflight(ip,prof);
 
-  for(let attempt=0;attempt<3;attempt++){
-    const mail=$('#useEmail').checked?await makeMail():null;
-    if(mail)log('addr: '+mail.address,'ld');
+    for(let attempt=0;attempt<3;attempt++){
+      const mail=$('#useEmail').checked?await makeMail():null;
+      if(mail)log('addr: '+mail.address,'ld');
 
-    const payload={username,password,email:mail?mail.address:undefined,consent:true,
-      fingerprint:hex(16),captcha_key:null,date_of_birth:'2000-01-01',
-      gift_code_sku_id:null,unique_username_registration:true};
+      const payload={username,password,email:mail?mail.address:undefined,consent:true,
+        fingerprint:prof.fingerprint,captcha_key:null,date_of_birth:'2000-01-01',
+        gift_code_sku_id:null,unique_username_registration:true};
 
-    let r=await postRegister(payload,null);
-    log('reg: '+r.status+' '+(r.text||'').slice(0,160),'ld');
+      let r=await postRegister(payload,null,ip,prof);
+      log('reg: '+r.status+' '+(r.text||'').slice(0,160),'ld');
 
-    // captcha 要求は rqdata を添えて解き直す（トークンは使い捨てなので最大2回まで）
-    let guard=0;
-    while(needsCaptcha(r.body)&&guard<2){
-      guard++;
-      const c=capChallenge(r);
-      log('reg captcha 要求 (rqdata:'+(c.rqdata?'有':'無')+' rqtoken:'+(c.rqtoken?'有':'無')+' sid:'+(c.sessionId?'有':'無')+')','lw');
-      const cap=await solveCaptcha(c,'https://discord.com/register');
-      r=await postRegister({...payload,...capFields(c,cap)},capHeaders(c,cap));
-      log('reg(captcha後): '+r.status+' '+(r.text||'').slice(0,160),'ld');
-    }
+      // captcha 要求は rqdata を添えて解き直す（トークンは使い捨てなので最大2回まで）
+      let guard=0;
+      while(needsCaptcha(r.body)&&guard<2){
+        guard++;captchaHit=true;
+        const c=capChallenge(r);
+        log('reg captcha 要求 (rqdata:'+(c.rqdata?'有':'無')+' rqtoken:'+(c.rqtoken?'有':'無')+' sid:'+(c.sessionId?'有':'無')+')','lw');
+        const cap=await solveCaptcha(c,'https://discord.com/register',ip,prof);
+        r=await postRegister({...payload,...capFields(c,cap)},capHeaders(c,cap),ip,prof);
+        log('reg(captcha後): '+r.status+' '+(r.text||'').slice(0,160),'ld');
+      }
 
-    if(r.status===200&&r.body&&r.body.token)return await finish(r.body.token,username,mail);
+      if(r.status===200&&r.body&&r.body.token)return await finish(r.body.token,username,mail,ip,prof);
 
-    // プロキシが 5xx を返しても Discord 側では作成済みのことがある。まずログインで確認する
-    if((r.status===0||r.status>=500)&&mail){
-      log('5xx のためログインで確認','ld');
-      const probe=await loginWithCaptcha(mail.address,password);
-      if(probe.token){sRec++;$('#sRec').textContent=sRec;log('回収: '+mail.address,'lg');return await finish(probe.token,username,mail)}
-      last=new Error('HTTP '+r.status);
-      continue;
-    }
-
-    const raw=JSON.stringify(r.body||{});
-    if(/EMAIL_ALREADY_REGISTERED/.test(raw)&&mail){
-      // アドレスは使い捨てなので、まず新しいアドレスで登録をやり直す
-      if(attempt<2){
-        log('既登録 → 新しいアドレスで再試行','ld');
-        last=new Error('EMAIL_ALREADY_REGISTERED');
-        await sleep(800);
+      // プロキシが 5xx を返しても Discord 側では作成済みのことがある。まずログインで確認する
+      if((r.status===0||r.status>=500)&&mail){
+        log('5xx のためログインで確認','ld');
+        const probe=await loginWithCaptcha(mail.address,password,ip,prof);
+        if(probe.token){sRec++;$('#sRec').textContent=sRec;log('回収: '+mail.address,'lg');return await finish(probe.token,username,mail,ip,prof)}
+        last=new Error('HTTP '+r.status);
         continue;
       }
-      log('既登録 → ログインで回収','ld');
-      const lg=await loginWithCaptcha(mail.address,password);
-      if(lg.token){sRec++;$('#sRec').textContent=sRec;log('回収: '+mail.address,'lg');return await finish(lg.token,username,mail)}
-      log('login失敗 HTTP '+lg.status+' '+JSON.stringify(lg.body||{}).slice(0,180),'ld');
-      last=new Error('login失敗 HTTP '+lg.status);
-    }else{
-      const detail=(r.body&&r.body.errors)?JSON.stringify(r.body.errors):(r.text||('HTTP '+r.status));
-      last=new Error(detail.slice(0,220));
-      last.captcha=needsCaptcha(r.body);
-      if(last.captcha)throw last;
+
+      const raw=JSON.stringify(r.body||{});
+      if(/EMAIL_ALREADY_REGISTERED/.test(raw)&&mail){
+        // アドレスは使い捨てなので、まず新しいアドレスで登録をやり直す
+        if(attempt<2){
+          log('既登録 → 新しいアドレスで再試行','ld');
+          last=new Error('EMAIL_ALREADY_REGISTERED');
+          await sleep(800);
+          continue;
+        }
+        log('既登録 → ログインで回収','ld');
+        const lg=await loginWithCaptcha(mail.address,password,ip,prof);
+        if(lg.token){sRec++;$('#sRec').textContent=sRec;log('回収: '+mail.address,'lg');return await finish(lg.token,username,mail,ip,prof)}
+        log('login失敗 HTTP '+lg.status+' '+JSON.stringify(lg.body||{}).slice(0,180),'ld');
+        last=new Error('login失敗 HTTP '+lg.status);
+      }else{
+        const detail=(r.body&&r.body.errors)?JSON.stringify(r.body.errors):(r.text||('HTTP '+r.status));
+        last=new Error(detail.slice(0,220));
+        last.captcha=needsCaptcha(r.body);
+        if(last.captcha)throw last;
+      }
+      await sleep(1200);
     }
-    await sleep(1200);
+    throw last;
+  }finally{
+    releaseIp(ip,captchaHit);
   }
-  throw last;
 }
 
 let sOk=0,sNg=0,sCap=0;
@@ -617,7 +730,9 @@ async function runGen(){
   const total=+$('#genCount').value,conc=+$('#genConc').value,gap=+$('#genGap').value;
   if(!proxyEndpoint()&&$('#useEmail').checked){log('プロキシ未設定: メール作成が CORS で失敗します','lw')}
   if(!hasKey())log('captcha キー未設定: captcha で止まります','lw');
-  if(proxyEndpoint()&&!$('#proxyOn').checked)log('上流プロキシ未使用: captcha の解答が IP 不一致で弾かれやすいです','lw');
+  if(!$('#proxyOn').checked)log('上流プロキシ未使用: captcha を回避できません（IP が毎回変わります）','lw');
+  else if(proxyList().length<Math.ceil(total/Math.max(1,+$('#ipMax').value||1)))
+    log('IP 数が足りません。'+proxyList().length+' IP では待機が発生します','lw');
   let started=0,done=0;
   const worker=async()=>{
     while(!stopped&&started<total){
@@ -778,7 +893,7 @@ $('#btnImport').onclick=async()=>{$('#btnImport').disabled=true;try{await import
 $('#btnCopy').onclick=()=>{navigator.clipboard.writeText(tokens.map(o=>o.t).join('\n'));log('コピーしました','ld')};
 $('#btnClear').onclick=()=>{tokens=[];save();renderTokens();log('トークン消去','ld')};
 
-['proxyUrl','proxyKey','capKey','capProv','capUseProxy','proxyList','proxyOn','autoPurge','msg','spamCount','spamGap','spamJitter','spamConc','chanOrder','spamRetry','randMsg','genCount','genConc','genGap','useEmail','joinConc','joinGap','joinSkip','guildId','chanIds','inviteCode','importVerify']
+['proxyUrl','proxyKey','capKey','capProv','capUseProxy','proxyList','proxyOn','autoPurge','msg','spamCount','spamGap','spamJitter','spamConc','chanOrder','spamRetry','randMsg','genCount','genConc','genGap','useEmail','joinConc','joinGap','joinSkip','guildId','chanIds','inviteCode','importVerify','stickyIp','ipMax','ipCool','preflight','fpSpoof']
 .forEach(id=>{const el=$('#'+id);const k='dts_'+id;
   const v=localStorage.getItem(k);
   if(v!==null){if(el.type==='checkbox')el.checked=v==='1';else el.value=v}
@@ -792,6 +907,8 @@ $('#capKey').addEventListener('change',()=>{
 });
 $('#capProv').addEventListener('change',()=>log('captcha サービス変更: '+capProv()+' / キー '+mask($('#capKey').value.trim()),'ld'));
 $('#capUseProxy').addEventListener('change',()=>log('captcha のプロキシ使用: '+($('#capUseProxy').checked?'ON':'OFF'),'ld'));
+$('#ipMax').addEventListener('change',()=>log('1 IP あたり最大: '+$('#ipMax').value,'ld'));
+$('#ipCool').addEventListener('change',()=>log('IP クールダウン: '+$('#ipCool').value+'分','ld'));
 
 function syncWarn(){$('#keyWarn').style.display=hasKey()?'none':'block'}
 syncWarn();
