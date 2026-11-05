@@ -5,7 +5,8 @@ const ALLOW = ['discord.com', 'discordapp.com', 'api.mail.tm', 'click.discord.co
 const FWD = ['content-type', 'authorization', 'x-super-properties', 'x-discord-locale',
              'x-discord-timezone', 'user-agent', 'accept', 'accept-language',
              'proxy-authorization', 'x-upstream-proxy', 'x-discord-cookie',
-             'x-captcha-key', 'x-captcha-rqtoken', 'x-captcha-session-id', 'x-captcha-rqdata'];
+             'x-captcha-key', 'x-captcha-rqtoken', 'x-captcha-session-id', 'x-captcha-rqdata',
+             'x-fingerprint'];
 
 const cors = {
   'Access-Control-Allow-Origin': '*',
