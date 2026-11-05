@@ -6,7 +6,6 @@ const ALLOW = new Set([
   'proxylist.geonode.com',
 ]);
 
-// クライアント → ここ → 上流
 const FWD = [
   'content-type', 'authorization', 'x-super-properties', 'x-discord-locale',
   'x-discord-timezone', 'user-agent', 'accept', 'accept-language', 'cookie',
@@ -14,7 +13,6 @@ const FWD = [
   'x-captcha-session-id', 'x-captcha-rqdata',
 ];
 
-// 戻さない / 中継しないヘッダ
 const HOP = new Set([
   'connection', 'keep-alive', 'transfer-encoding', 'content-encoding',
   'content-length', 'proxy-connection', 'proxy-authenticate', 'te', 'trailer',
@@ -76,7 +74,6 @@ export async function onRequest({ request, env }) {
     const [h, p, user, pass] = up.split(':');
     if (h && p) {
       dest = `http://${h}:${p}${t.pathname}${t.search}`;
-      // 上流プロキシが Host で振り分けるタイプならこれが要る
       try { headers.set('host', t.host); } catch {}
       if (user) headers.set('proxy-authorization', 'Basic ' + b64(`${user}:${pass || ''}`));
     }
