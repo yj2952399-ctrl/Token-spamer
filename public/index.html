@@ -183,12 +183,12 @@
   <h3>captcha 回避 / レート制限</h3>
   <div class="chk"><input type="checkbox" id="stickyIp" checked><span>プロキシをアカウントごとに固定する（登録とログインを同じ IP で行う）</span></div>
   <div class="row">
-    <div><label>1 IP あたりの最大アカウント数</label><input id="ipMax" type="number" value="1" min="1" max="50"></div>
-    <div><label>IP クールダウン (分)</label><input id="ipCool" type="number" value="15" min="0" max="1440"></div>
+    <div><label>1 IP あたりの最大アカウント数</label><input id="ipMax" type="number" value="3" min="1" max="50"></div>
+    <div><label>IP クールダウン (分)</label><input id="ipCool" type="number" value="3" min="0" max="1440"></div>
   </div>
   <div class="row">
-    <div><label>同一 IP の最小間隔 (秒)</label><input id="ipGap" type="number" value="60" min="0" max="3600"></div>
-    <div><label>429 時の冷却 (秒)</label><input id="rateCool" type="number" value="300" min="60" max="3600"></div>
+    <div><label>同一 IP の最小間隔 (秒)</label><input id="ipGap" type="number" value="90" min="0" max="3600"></div>
+    <div><label>429 時の冷却 (秒)</label><input id="rateCool" type="number" value="180" min="60" max="3600"></div>
   </div>
   <div class="chk"><input type="checkbox" id="preflight" checked><span>事前に location-metadata を取得して locale / 国コードを合わせる</span></div>
   <div class="chk"><input type="checkbox" id="fpSpoof" checked><span>UA / super properties / fingerprint を 1 プロファイルに統一する</span></div>
@@ -213,7 +213,8 @@
 const FWD = ['content-type', 'authorization', 'x-super-properties', 'x-discord-locale',
              'x-discord-timezone', 'user-agent', 'accept', 'accept-language',
              'proxy-authorization', 'x-upstream-proxy', 'x-discord-cookie',
-             'x-captcha-key', 'x-captcha-rqtoken', 'x-captcha-session-id', 'x-captcha-rqdata'];
+             'x-captcha-key', 'x-captcha-rqtoken', 'x-captcha-session-id', 'x-captcha-rqdata',
+             'x-fingerprint'];
 
 const cors = {
   'Access-Control-Allow-Origin': '*',
@@ -288,6 +289,7 @@ function randStr(n){const b=new Uint8Array(n);crypto.getRandomValues(b);
 function nonce(){return Date.now().toString()+rnd(1000,9999);}
 const mask=k=>!k?'(未設定)':k.slice(0,4)+'…'+k.slice(-4)+' ('+k.length+'文字)';
 const localTz=Intl.DateTimeFormat().resolvedOptions().timeZone||'UTC';
+const backoff=a=>sleep(1500+a*1500+rnd(0,1200));
 
 const SUPER=btoa(JSON.stringify({os:'Android',browser:'Discord Android',device:'',system_locale:'en-US',
   client_version:'263.0',release_channel:'googleRelease',device_vendor:'google',device_model:'Pixel 8',
@@ -374,11 +376,13 @@ function releaseIp(ip,mode){
   const s=stateOf(ipKey(ip));
   s.last=Date.now();
   if(mode==='captcha'){
-    s.until=Date.now()+Math.max(60000,(+$('#ipCool').value||0)*60000);
+    // ipCool は「分」。ms に直してから比較する
+    s.until=Date.now()+Math.max(60,(+$('#ipCool').value||0)*60)*1000;
     s.used=0;return;
   }
   if(mode==='rate'){
-    s.until=Date.now()+Math.max(60000,(+$('#rateCool').value||300))*1000;
+    // rateCool は「秒」。以前はここで 60000*1000 = 16.7時間になっていた
+    s.until=Date.now()+Math.max(60,+$('#rateCool').value||300)*1000;
     s.used=0;return;
   }
   s.used++;
@@ -450,7 +454,7 @@ async function dfetch(path,opt={}){
     'X-Super-Properties':prof?prof.super:SUPER,
     'X-Discord-Locale':prof?prof.locale:'en-US',
     'X-Discord-Timezone':prof?prof.tz:localTz};
-  if(prof){h['User-Agent']=prof.ua;h['Accept-Language']=prof.lang}
+  if(prof){h['User-Agent']=prof.ua;h['Accept-Language']=prof.lang;h['X-Fingerprint']=prof.fingerprint}
   if(ep)h['X-Discord-Cookie']=stateOf(ipKey(up)).jar;
   if(token)h.Authorization=token;
   if(up)h['X-Upstream-Proxy']=up;
@@ -578,7 +582,10 @@ async function importTokens(){
 }
 
 /* ---------- captcha ---------- */
-function needsCaptcha(b){return !!(b&&b.captcha_key&&/captcha-required/.test(JSON.stringify(b.captcha_key)))}
+// invalid-response / invalid-input-response も「解き直し対象」に含める
+function needsCaptcha(b){
+  return !!(b&&b.captcha_key&&/captcha-required|invalid-(input-)?response/i.test(JSON.stringify(b.captcha_key)));
+}
 function capProv(){return $('#capProv').value}
 function hasKey(){return !!$('#capKey').value.trim()}
 
@@ -591,7 +598,8 @@ function capChallenge(r){
     rqdata:b.captcha_rqdata||fromHdr('captcha_rqdata'),
     rqtoken:b.captcha_rqtoken||fromHdr('captcha_rqtoken'),
     sessionId:b.captcha_session_id||fromHdr('captcha_session_id'),
-    invisible:!!b.should_serve_invisible
+    invisible:!!b.should_serve_invisible,
+    fallback:false
   };
 }
 function capFields(c, token){
@@ -741,6 +749,23 @@ async function waitVerifyToken(mail){
   }
   return null;
 }
+// パスワードリセット用のトークン（verify メールと取り違えないよう件名で絞る）
+async function waitResetToken(mail){
+  for(let i=0;i<30;i++){
+    await sleep(2500);
+    const l=await mailReq('/messages',{token:mail.token});
+    const arr=(l.body&&l.body['hydra:member'])||[];
+    for(const msg of arr){
+      const subj=String(msg.subject||'');
+      const m=await mailReq('/messages/'+msg.id,{token:mail.token});
+      const txt=JSON.stringify(m.body||{});
+      let mm=txt.match(/reset#token=([A-Za-z0-9_\-\.]+)/);
+      if(!mm&&/reset|password|パスワード/i.test(subj+txt))mm=txt.match(/token=([A-Za-z0-9_\-\.]{20,})/);
+      if(mm)return mm[1];
+    }
+  }
+  return null;
+}
 
 /* ---------- register ---------- */
 let sRec=0;
@@ -752,19 +777,46 @@ async function finish(tok,username,mail,ip,prof){
   if(v.body&&v.body.token)tok=v.body.token;
   return{token:tok,user:username,status:'ok'};
 }
-// 5xx では再送しない（アカウントは既に作られていることがあり、二重送信で EMAIL_ALREADY_REGISTERED を誘発するため）
+// register は二重送信が最大の敵なので retries は 1
 function postRegister(payload,headers,ip,prof){
-  return dfetch('/auth/register',{method:'POST',retries:2,retry5xx:false,ip,prof,body:JSON.stringify(payload),headers});
+  return dfetch('/auth/register',{method:'POST',retries:1,retry5xx:false,ip,prof,body:JSON.stringify(payload),headers});
 }
+
+// チャレンジだけ先に取る。空ボディなら保留ユーザーを作らずに captcha 要求だけ返る。
+// 返らない場合のみ従来方式（このときだけ保留ユーザーができる）にフォールバック。
+async function fetchChallenge(ip,prof,payload){
+  let r=await dfetch('/auth/register',{method:'POST',retries:1,retry5xx:false,ip,prof,body:'{}'});
+  if(needsCaptcha(r.body))return capChallenge(r);
+  r=await postRegister(payload,null,ip,prof);
+  if(needsCaptcha(r.body)){
+    const c=capChallenge(r);
+    c.fallback=true;
+    log('challenge 先行取得できず → 従来方式 (保留ユーザーが残る可能性)','lw');
+    return c;
+  }
+  return null;
+}
+
 async function preflight(ip,prof){
   if(!$('#preflight').checked)return;
   const r=await dfetch('/auth/location-metadata',{ip,prof,retries:1});
   if(r.body&&r.body.country_code){
     prof.country=r.body.country_code;
-    prof.locale=r.body.country_code==='JP'?'ja':'en-US';
+    prof.locale=prof.country==='JP'?'ja':'en-US';
     prof.lang=prof.locale+',en;q=0.9';
     log('locale 合わせ: '+prof.country+' / '+prof.locale,'ld');
   }
+}
+
+// サーバー由来の fingerprint を取って Cookie と紐付ける
+async function primeFingerprint(ip,prof){
+  try{
+    const r=await dfetch('/experiments',{ip,prof,retries:1});
+    if(r.body&&r.body.fingerprint){
+      prof.fingerprint=r.body.fingerprint;
+      log('fingerprint 取得','ld');
+    }
+  }catch(e){log('fingerprint 取得失敗 → ローカル生成値を使用','lw')}
 }
 
 // solver が UNSOLVABLE を返したら、新しいチャレンジを取り直して解き直す
@@ -792,18 +844,48 @@ async function loginWithCaptcha(email,password,ip,prof){
   return{status:r.status,body:r.body};
 }
 
+// 既登録・保留状態の回収: ログイン → だめならパスワードリセット
+async function recoverAccount(mail,password,ip,prof){
+  const lg=await loginWithCaptcha(mail.address,password,ip,prof);
+  if(lg.token)return lg.token;
+  log('ログイン不可 ('+lg.status+') → リセットで回収','ld');
+
+  const r0=await dfetch('/auth/forgot',{method:'POST',retries:1,retry5xx:false,ip,prof,
+    body:JSON.stringify({login:mail.address,captcha_key:null})});
+  if(needsCaptcha(r0.body)){
+    const c=capChallenge(r0);
+    const cap=await solveCaptcha(c,'https://discord.com/reset-password',ip,prof);
+    await dfetch('/auth/forgot',{method:'POST',retries:1,retry5xx:false,ip,prof,
+      body:JSON.stringify({login:mail.address,...capFields(c,cap)}),headers:capHeaders(c,cap)});
+  }else if(r0.status!==200&&r0.status!==204){
+    log('forgot 失敗 HTTP '+r0.status,'lw');
+    return null;
+  }
+  const rt=await waitResetToken(mail);
+  if(!rt){log('リセットメールが来ない','lw');return null}
+
+  const np=randStr(12)+'Aa1!';
+  const rs=await dfetch('/auth/reset',{method:'POST',retries:1,retry5xx:false,ip,prof,
+    body:JSON.stringify({token:rt,password:np})});
+  saveCred(mail.address,np);
+  if(rs.body&&rs.body.token)return rs.body.token;
+  const lg2=await loginWithCaptcha(mail.address,np,ip,prof);
+  return lg2.token||null;
+}
+
 async function registerOne(){
   const username=pick(ADJ)+pick(NOUN)+rnd(10,9999);
   const password=randStr(12)+'Aa1!';
   const prof=makeProfile();
   let ip=await acquireIp();
-  let captchaHit=false;
   let last=null;
-  let triedLogin=false;
+  let ok=false;
   try{
     await preflight(ip,prof);
+    await primeFingerprint(ip,prof);
 
     for(let attempt=0;attempt<6;attempt++){
+      let triedLogin=false;                       // ← attempt ごとに戻す
       const mail=$('#useEmail').checked?await makeMail():null;
       if(mail)log('addr: '+mail.address,'ld');
 
@@ -811,27 +893,24 @@ async function registerOne(){
         fingerprint:prof.fingerprint,captcha_key:null,date_of_birth:'2000-01-01',
         gift_code_sku_id:null,unique_username_registration:true};
 
-      let r=await postRegister(payload,null,ip,prof);
-      log('reg: '+r.status+' '+(r.text||'').slice(0,160),'ld');
+      // 1) チャレンジだけ取る（アカウントはまだ作られない）
+      let ch=null;
+      try{ch=await fetchChallenge(ip,prof,payload)}
+      catch(e){log('challenge 取得失敗 ('+e.message+')','lw');last=e;await backoff(attempt);continue}
+      if(!ch){log('challenge が取れない → 振り直し','lw');last=new Error('no challenge');await backoff(attempt);continue}
 
-      let guard=0;
-      while(needsCaptcha(r.body)&&guard<3){
-        guard++;captchaHit=true;
-        const c=capChallenge(r);
-        log('reg captcha 要求 (rqdata:'+(c.rqdata?'有':'無')+' rqtoken:'+(c.rqtoken?'有':'無')+' sid:'+(c.sessionId?'有':'無')+')','lw');
-        let cap=null;
-        try{cap=await solveCaptcha(c,'https://discord.com/register',ip,prof)}
-        catch(e){
-          log('solver 失敗 ('+e.message+') → チャレンジ再取得','lw');
-          if(guard<3){await sleep(2500);r=await postRegister({...payload},null,ip,prof);continue}
-          throw e;
-        }
-        r=await postRegister({...payload,...capFields(c,cap)},capHeaders(c,cap),ip,prof);
-        log('reg(captcha後): '+r.status+' '+(r.text||'').slice(0,160),'ld');
-      }
+      // 2) solve
+      let cap=null;
+      try{cap=await solveCaptcha(ch,'https://discord.com/register',ip,prof)}
+      catch(e){log('solver 失敗 ('+e.message+') → 振り直し','lw');last=e;await backoff(attempt);continue}
+
+      // 3) 本登録は 1 発だけ
+      const r=await postRegister({...payload,...capFields(ch,cap)},capHeaders(ch,cap),ip,prof);
+      log('reg: '+r.status+' '+(r.text||'').slice(0,160),'ld');
 
       if(r.status===200&&r.body&&r.body.token){
         if(mail)saveCred(mail.address,password);
+        ok=true;
         return await finish(r.body.token,username,mail,ip,prof);
       }
 
@@ -845,39 +924,45 @@ async function registerOne(){
         continue;
       }
 
-      // 5xx / 通信断: 登録自体は成立している可能性が高いので、まずログインで回収する
+      // 5xx / 通信断: 登録自体は成立している可能性が高いので、まず回収を確認する
       if((r.status===0||r.status>=500)&&mail){
-        log('5xx → ログインで回収を確認','ld');
-        const probe=await loginWithCaptcha(mail.address,password,ip,prof);
-        if(probe.token){sRec++;$('#sRec').textContent=sRec;log('回収: '+mail.address,'lg');return await finish(probe.token,username,mail,ip,prof)}
+        log('5xx → 回収を確認','ld');
+        const tk=await recoverAccount(mail,password,ip,prof);
+        if(tk){sRec++;$('#sRec').textContent=sRec;log('回収: '+mail.address,'lg');ok=true;return await finish(tk,username,mail,ip,prof)}
         last=new Error('HTTP '+r.status);
-        continue;
+        await backoff(attempt);continue;
+      }
+
+      // 最終レスポンスがまた captcha 要求（トークン失効）なら、振り直して解き直す
+      if(needsCaptcha(r.body)){
+        log('captcha 失効 → 振り直し','lw');
+        last=new Error('captcha');
+        last.captcha=true;
+        await backoff(attempt);continue;
       }
 
       const raw=JSON.stringify(r.body||{});
       if(/EMAIL_ALREADY_REGISTERED/.test(raw)&&mail){
         if(!triedLogin){
           triedLogin=true;
-          log('既登録 → 現パスワードで回収を試行','ld');
-          const lg=await loginWithCaptcha(mail.address,creds[mail.address]||password,ip,prof);
-          if(lg.token){sRec++;$('#sRec').textContent=sRec;log('回収: '+mail.address,'lg');return await finish(lg.token,username,mail,ip,prof)}
-          log('回収失敗 ('+lg.status+') → 振り直し','ld');
+          log('既登録 → 回収を試行','ld');
+          const tk=await recoverAccount(mail,creds[mail.address]||password,ip,prof);
+          if(tk){sRec++;$('#sRec').textContent=sRec;log('回収: '+mail.address,'lg');ok=true;return await finish(tk,username,mail,ip,prof)}
+          log('回収失敗 → 振り直し','ld');
         }else{
           log('既登録 → 即振り直し','ld');
         }
         last=new Error('EMAIL_ALREADY_REGISTERED');
-        if(attempt<5)continue;
+        if(attempt<5){await backoff(attempt);continue}
       }else{
         const detail=(r.body&&r.body.errors)?JSON.stringify(r.body.errors):(r.text||('HTTP '+r.status));
         last=new Error(detail.slice(0,220));
-        last.captcha=needsCaptcha(r.body);
-        if(last.captcha)throw last;
       }
-      await sleep(1500+attempt*1500+rnd(0,1200));
+      await backoff(attempt);
     }
     throw last;
   }finally{
-    releaseIp(ip,captchaHit?'captcha':null);
+    releaseIp(ip,ok?null:'captcha');
   }
 }
 
