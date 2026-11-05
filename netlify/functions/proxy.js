@@ -1,4 +1,5 @@
-const ALLOW = ['discord.com', 'discordapp.com', 'api.mail.tm', 'click.discord.com', 'cdn.discordapp.com'];
+const ALLOW = ['discord.com', 'discordapp.com', 'api.mail.tm', 'click.discord.com',
+               'cdn.discordapp.com', '2captcha.com', 'api.yescaptcha.com'];
 const FWD = ['content-type', 'authorization', 'x-super-properties', 'x-discord-locale',
              'x-discord-timezone', 'user-agent', 'proxy-authorization'];
 
@@ -22,7 +23,6 @@ exports.handler = async (event) => {
   const headers = {};
   for (const k of FWD) if (event.headers[k]) headers[k] = event.headers[k];
 
-  // 本文を確実に復元する
   const raw = event.body || '';
   const buf = event.isBase64Encoded ? Buffer.from(raw, 'base64') : Buffer.from(raw, 'utf8');
   const body = ['GET', 'HEAD'].includes(event.httpMethod) || buf.length === 0 ? undefined : buf;
