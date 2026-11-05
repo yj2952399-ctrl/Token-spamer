@@ -96,6 +96,15 @@
     <button class="btn sec" id="btnStop1">停止</button>
   </div>
   <div class="stat"><div><b id="sOk">0</b>成功</div><div><b id="sNg">0</b>失敗</div><div><b id="sCap">0</b>captcha</div><div><b id="sRec">0</b>回収</div></div>
+
+  <div class="card">
+    <div style="font-size:12px;font-weight:500">外部で取得したトークンを使う（生成をスキップ）</div>
+    <p class="hint">1行1個。カンマ・空白区切りも可。<code>mail:pass:token</code> 形式なら末尾を使います。</p>
+    <textarea id="importTxt" rows="4" placeholder="MTIzNDU2Nzg5...&#10;OTg3NjU0MzIx..."></textarea>
+    <div class="chk"><input type="checkbox" id="importVerify" checked><span>貼り付け時にユーザー名を取得して有効性を確認する</span></div>
+    <div class="btns"><button class="btn sec" id="btnImport">貼り付けたトークンを追加</button></div>
+  </div>
+
   <div class="card">
     <div style="display:flex;justify-content:space-between;align-items:center">
       <span style="font-size:12px;font-weight:500">トークン <span id="tokCount" style="color:var(--host-fg-muted)">(0)</span></span>
@@ -156,7 +165,7 @@
   </select>
   <label>APIキー</label>
   <input id="capKey" placeholder="各サービスの API キー / clientKey">
-  <p class="hint">captcha が出たときだけ使います。2captcha は hCaptcha 1件 約 $0.001〜0.003、10〜30秒。YesCaptcha は HCaptchaTaskProxyless で 1件30ポイント。</p>
+  <p class="hint">captcha が出たときだけ使います。2captcha は hCaptcha 1件 約 $0.001〜0.003、10〜30秒。YesCaptcha は HCaptchaTaskProxyless で 1件30ポイント。入力・変更するとログに残ります。</p>
   <label>プロキシエンドポイント</label>
   <input id="proxyUrl" value="/api/proxy" placeholder="/api/proxy">
   <p class="hint">同一オリジンの Function を既定にしています。リダイレクトで本文が落ちる場合は <code>/.netlify/functions/proxy</code> を直接指定。空にすると直接 api.discord.com を叩きます。</p>
@@ -240,6 +249,7 @@ const rnd=(a,b)=>Math.floor(Math.random()*(b-a+1))+a;
 const pick=a=>a[Math.floor(Math.random()*a.length)];
 function hex(n){const b=new Uint8Array(n);crypto.getRandomValues(b);return [...b].map(x=>x.toString(16).padStart(2,'0')).join('');}
 function nonce(){return Date.now().toString()+rnd(1000,9999);}
+const mask=k=>!k?'(未設定)':k.slice(0,4)+'…'+k.slice(-4)+' ('+k.length+'文字)';
 
 const SUPER=btoa(JSON.stringify({os:'Android',browser:'Discord Android',device:'',system_locale:'en-US',
   client_version:'263.0',release_channel:'googleRelease',device_vendor:'google',device_model:'Pixel 8',
@@ -313,6 +323,47 @@ async function dfetch(path,opt={}){
   return{status:0,body:null};
 }
 
+/* ---------- token import ---------- */
+function normTok(s){
+  s=s.trim().replace(/^["']|["']$/g,'');
+  if(s.includes(':')){
+    const p=s.split(':').pop().trim();
+    if(p.length>20)return p;
+  }
+  return s;
+}
+async function importTokens(){
+  const raw=$('#importTxt').value.split(/[\s,]+/).map(normTok).filter(x=>x.length>20);
+  if(!raw.length){log('貼り付けが空か、トークンとして短すぎます','le');return}
+  const verify=$('#importVerify').checked;
+  let add=0,dup=0,bad=0;
+  for(const t of raw){
+    if(tokens.some(o=>o.t===t)){dup++;continue}
+    const rec={t,u:'?',s:'unverified'};
+    tokens.push(rec);save();renderTokens();add++;
+    if(verify){
+      const r=await dfetch('/users/@me',{token:t,retries:1});
+      if(r.status===200&&r.body){
+        rec.u=r.body.global_name||r.body.username||'?';
+        rec.s='ok';
+        log('+ '+(rec.u)+' ('+t.slice(0,10)+'…)','lg');
+      }else if(r.status===401){
+        rec.s='bad';bad++;
+        log('無効: '+t.slice(0,10)+'…','le');
+      }else{
+        rec.s='unverified';
+        log('未検証: '+t.slice(0,10)+'… HTTP '+r.status,'lw');
+      }
+      save();renderTokens();
+      await sleep(400);
+    }else{
+      log('+ 未検証のまま追加 ('+t.slice(0,10)+'…)','ld');
+    }
+  }
+  log('取込: 追加 '+add+' / 重複 '+dup+(verify?' / 無効 '+bad:''),'ld');
+  if(!dup&&!bad)$('#importTxt').value='';
+}
+
 /* ---------- captcha ---------- */
 function needsCaptcha(b){return !!(b&&b.captcha_key&&/captcha-required/.test(JSON.stringify(b.captcha_key)))}
 function capProv(){return $('#capProv').value}
@@ -322,7 +373,7 @@ async function solveCaptcha(sitekey,pageurl){
   const key=$('#capKey').value.trim();
   if(!key)throw new Error('captcha 要求 / APIキー未設定');
   const prov=capProv();
-  log('captcha 解決中… ('+prov+')','lw');
+  log('captcha 解決中… ('+prov+' / '+mask(key)+')','lw');
 
   if(prov==='yescaptcha'){
     const BASE='https://api.yescaptcha.com';
@@ -648,18 +699,28 @@ $('#btnJoin').onclick=()=>{$('#btnJoin').disabled=true;runJoin().finally(()=>$('
 $('#btnSpam').onclick=()=>{$('#btnSpam').disabled=true;runSpam().finally(()=>$('#btnSpam').disabled=false)};
 $('#btnStop1').onclick=$('#btnStop2').onclick=$('#btnStop3').onclick=()=>{stopped=true;log('停止要求','lw')};
 $('#btnFetch').onclick=fetchChannels;
+$('#btnImport').onclick=async()=>{$('#btnImport').disabled=true;try{await importTokens()}finally{$('#btnImport').disabled=false}};
 $('#btnCopy').onclick=()=>{navigator.clipboard.writeText(tokens.map(o=>o.t).join('\n'));log('コピーしました','ld')};
 $('#btnClear').onclick=()=>{tokens=[];save();renderTokens();log('トークン消去','ld')};
 
-['proxyUrl','proxyKey','capKey','capProv','proxyList','proxyOn','autoPurge','msg','spamCount','spamGap','spamJitter','spamConc','chanOrder','spamRetry','randMsg','genCount','genConc','genGap','useEmail','joinConc','joinGap','joinSkip','guildId','chanIds','inviteCode']
+['proxyUrl','proxyKey','capKey','capProv','proxyList','proxyOn','autoPurge','msg','spamCount','spamGap','spamJitter','spamConc','chanOrder','spamRetry','randMsg','genCount','genConc','genGap','useEmail','joinConc','joinGap','joinSkip','guildId','chanIds','inviteCode','importVerify']
 .forEach(id=>{const el=$('#'+id);const k='dts_'+id;
   const v=localStorage.getItem(k);
   if(v!==null){if(el.type==='checkbox')el.checked=v==='1';else el.value=v}
   el.addEventListener('change',()=>{localStorage.setItem(k,el.type==='checkbox'?(el.checked?'1':'0'):el.value);syncWarn()});
 });
+
+$('#capKey').addEventListener('change',()=>{
+  const k=$('#capKey').value.trim();
+  if(k)log('APIキー設定 ('+capProv()+'): '+mask(k),'ld');
+  else log('APIキー消去','ld');
+});
+$('#capProv').addEventListener('change',()=>log('captcha サービス変更: '+capProv()+' / キー '+mask($('#capKey').value.trim()),'ld'));
+
 function syncWarn(){$('#keyWarn').style.display=hasKey()?'none':'block'}
 syncWarn();
 renderTokens();
+if(hasKey())log('APIキー読込済 ('+capProv()+'): '+mask($('#capKey').value.trim()),'ld');
 log('準備完了。プロキシ未設定なら直接モード。','ld');
 })();
 </script>
