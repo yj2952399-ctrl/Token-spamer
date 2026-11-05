@@ -166,7 +166,7 @@
   <label>APIキー</label>
   <input id="capKey" placeholder="各サービスの API キー / clientKey">
   <p class="hint">captcha が出たときだけ使います。2captcha は hCaptcha 1件 約 $0.001〜0.003、10〜30秒。YesCaptcha は 1件30ポイント。入力・変更するとログに残ります。</p>
-  <div class="chk"><input type="checkbox" id="capUseProxy"><span>captcha も上流プロキシ経由で解く（IP を揃える / 通過率が上がる・料金は半額）</span></div>
+  <div class="chk"><input type="checkbox" id="capUseProxy" checked><span>captcha も上流プロキシ経由で解く（IP を揃える / これが OFF だと UNSOLVABLE になりやすい）</span></div>
 
   <h3>プロキシ自動取得</h3>
   <div class="chk"><input type="checkbox" id="autoProxy"><span>プロキシを自動取得・検証して使う（未設定時のみ起動）</span></div>
@@ -356,7 +356,7 @@ async function acquireIp(){
   const maxPer=Math.max(1,+$('#ipMax').value||1);
   const gapMs=Math.max(0,+$('#ipGap').value||0)*1000;
   for(let g=0;g<2000;g++){
-    if(stopped)return useProxy?pick(list):null;
+    if(stopped)return useProxy?expandProxy(pick(list)):null;
     const now=Date.now();
     const cands=list.filter(p=>{const s=stateOf(ipKey(p));
       return s.used<maxPer && now>=s.until && now-s.last>=gapMs});
@@ -437,8 +437,9 @@ async function ext(target,opt={}){
   const t=await r.text();let j=null;try{j=JSON.parse(t)}catch(e){}
   return{status:r.status,body:j,text:t,headers:r.headers};
 }
+// retry5xx:false は「副作用のある POST を二重送信しない」ため。登録で使う。
 async function dfetch(path,opt={}){
-  const {token,method='GET',body,retries=3,headers:extra}=opt;
+  const {token,method='GET',body,retries=3,headers:extra,retry5xx=true}=opt;
   const ep=proxyEndpoint();
   const target=API+path;
   const up=ipFor(opt);
@@ -467,7 +468,7 @@ async function dfetch(path,opt={}){
       if(i===retries)return{status:429,body:j,text:txt,rate:true,headers:r.headers};
       await sleep(Math.min(w,3600000));continue;
     }
-    if(r.status===502||r.status===503){
+    if((r.status===502||r.status===503)&&retry5xx){
       if(i===retries)return{status:r.status,body:j,text:txt,headers:r.headers};
       await sleep(800);continue;
     }
@@ -751,8 +752,9 @@ async function finish(tok,username,mail,ip,prof){
   if(v.body&&v.body.token)tok=v.body.token;
   return{token:tok,user:username,status:'ok'};
 }
+// 5xx では再送しない（アカウントは既に作られていることがあり、二重送信で EMAIL_ALREADY_REGISTERED を誘発するため）
 function postRegister(payload,headers,ip,prof){
-  return dfetch('/auth/register',{method:'POST',retries:2,ip,prof,body:JSON.stringify(payload),headers});
+  return dfetch('/auth/register',{method:'POST',retries:2,retry5xx:false,ip,prof,body:JSON.stringify(payload),headers});
 }
 async function preflight(ip,prof){
   if(!$('#preflight').checked)return;
@@ -764,16 +766,24 @@ async function preflight(ip,prof){
     log('locale 合わせ: '+prof.country+' / '+prof.locale,'ld');
   }
 }
+
+// solver が UNSOLVABLE を返したら、新しいチャレンジを取り直して解き直す
 async function loginWithCaptcha(email,password,ip,prof){
   const send=async(extra,extraHeaders)=>{
     const body={login:email,password,undelete:false,login_source:null,gift_code_sku_id:null,...(extra||{captcha_key:null})};
-    return dfetch('/auth/login',{method:'POST',retries:2,ip,prof,body:JSON.stringify(body),headers:extraHeaders});
+    return dfetch('/auth/login',{method:'POST',retries:2,retry5xx:false,ip,prof,body:JSON.stringify(body),headers:extraHeaders});
   };
   let r=await send(null,null);
-  for(let i=0;i<3&&needsCaptcha(r.body);i++){
+  for(let i=0;i<4&&needsCaptcha(r.body);i++){
     const c=capChallenge(r);
     log('login captcha 要求 (rqdata:'+(c.rqdata?'有':'無')+' rqtoken:'+(c.rqtoken?'有':'無')+' sid:'+(c.sessionId?'有':'無')+')','lw');
-    const cap=await solveCaptcha(c,'https://discord.com/login',ip,prof);
+    let cap=null;
+    try{cap=await solveCaptcha(c,'https://discord.com/login',ip,prof)}
+    catch(e){
+      log('solver 失敗 ('+e.message+') → チャレンジ再取得','lw');
+      if(i<3){await sleep(2500);r=await send(null,null);continue}
+      throw e;
+    }
     r=await send(capFields(c,cap),capHeaders(c,cap));
     log('login(captcha後): '+r.status+' '+(r.text||'').slice(0,160),'ld');
     if(r.body&&r.body.token)break;
@@ -805,11 +815,17 @@ async function registerOne(){
       log('reg: '+r.status+' '+(r.text||'').slice(0,160),'ld');
 
       let guard=0;
-      while(needsCaptcha(r.body)&&guard<2){
+      while(needsCaptcha(r.body)&&guard<3){
         guard++;captchaHit=true;
         const c=capChallenge(r);
         log('reg captcha 要求 (rqdata:'+(c.rqdata?'有':'無')+' rqtoken:'+(c.rqtoken?'有':'無')+' sid:'+(c.sessionId?'有':'無')+')','lw');
-        const cap=await solveCaptcha(c,'https://discord.com/register',ip,prof);
+        let cap=null;
+        try{cap=await solveCaptcha(c,'https://discord.com/register',ip,prof)}
+        catch(e){
+          log('solver 失敗 ('+e.message+') → チャレンジ再取得','lw');
+          if(guard<3){await sleep(2500);r=await postRegister({...payload},null,ip,prof);continue}
+          throw e;
+        }
         r=await postRegister({...payload,...capFields(c,cap)},capHeaders(c,cap),ip,prof);
         log('reg(captcha後): '+r.status+' '+(r.text||'').slice(0,160),'ld');
       }
@@ -829,8 +845,9 @@ async function registerOne(){
         continue;
       }
 
+      // 5xx / 通信断: 登録自体は成立している可能性が高いので、まずログインで回収する
       if((r.status===0||r.status>=500)&&mail){
-        log('5xx のためログインで確認','ld');
+        log('5xx → ログインで回収を確認','ld');
         const probe=await loginWithCaptcha(mail.address,password,ip,prof);
         if(probe.token){sRec++;$('#sRec').textContent=sRec;log('回収: '+mail.address,'lg');return await finish(probe.token,username,mail,ip,prof)}
         last=new Error('HTTP '+r.status);
@@ -874,8 +891,13 @@ async function runGen(){
     log('プロキシ未設定 → 自動取得します','ld');
     await loadAutoProxies();
   }
-  if(proxyActive())log('プロキシ '+proxyList().length+' 本で開始','ld');
-  else log('プロキシ未設定 → 自回線 1 本で実行（'+$('#ipGap').value+' 秒間隔 / '+$('#ipCool').value+' 分クールダウン適用）','lw');
+  if(proxyActive()){
+    log('プロキシ '+proxyList().length+' 本で開始','ld');
+    if(!$('#capUseProxy').checked)log('captcha が proxyless です。IP 不一致で UNSOLVABLE になりやすいので ON 推奨','lw');
+  }else{
+    log('プロキシ未設定 → 自回線 1 本で実行（'+$('#ipGap').value+' 秒間隔 / '+$('#ipCool').value+' 分クールダウン適用）','lw');
+    if($('#capUseProxy').checked)log('プロキシが無いので captcha は proxyless で解きます','ld');
+  }
   let started=0,done=0;
   const worker=async()=>{
     while(!stopped&&started<total){
