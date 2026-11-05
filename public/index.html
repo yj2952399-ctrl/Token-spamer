@@ -168,6 +168,18 @@
   <p class="hint">captcha が出たときだけ使います。2captcha は hCaptcha 1件 約 $0.001〜0.003、10〜30秒。YesCaptcha は 1件30ポイント。入力・変更するとログに残ります。</p>
   <div class="chk"><input type="checkbox" id="capUseProxy"><span>captcha も上流プロキシ経由で解く（IP を揃える / 通過率が上がる・料金は半額）</span></div>
 
+  <h3>プロキシ自動取得</h3>
+  <div class="chk"><input type="checkbox" id="autoProxy"><span>プロキシを自動取得・検証して使う（未設定時のみ起動）</span></div>
+  <label>取得元 URL（1行1個 / host:port 形式を返すもの）</label>
+  <textarea id="proxySrc" rows="3">https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&protocol=http&proxy_format=protocolipport&format=text</textarea>
+  <div class="row">
+    <div><label>集める本数</label><input id="proxyWant" type="number" value="20" min="1" max="200"></div>
+    <div><label>検証の同時数</label><input id="proxyCheckConc" type="number" value="8" min="1" max="30"></div>
+  </div>
+  <div class="btns"><button class="btn sec" id="btnProxyLoad">今すぐ取得・検証</button><button class="btn ghost" id="btnProxyClear">プロキシ全消去</button></div>
+  <div class="stat"><div><b id="pOk">0</b>有効</div><div><b id="pNg">0</b>不合格</div></div>
+  <div class="hint">取得したプロキシは上流プロキシ欄へ追記されます。無料の HTTP プロキシは寿命が短いので、1 アカウントごとに検証し直す前提で使ってください。Netlify の Function 呼び出し回数は 1 本につき 1 回消費します。</div>
+
   <h3>captcha 回避 / レート制限</h3>
   <div class="chk"><input type="checkbox" id="stickyIp" checked><span>プロキシをアカウントごとに固定する（登録とログインを同じ IP で行う）</span></div>
   <div class="row">
@@ -187,15 +199,17 @@
   <p class="hint">同一オリジンの Function を既定にしています。リダイレクトで本文が落ちる場合は <code>/.netlify/functions/proxy</code> を直接指定。空にすると直接 api.discord.com を叩きます。</p>
   <label>プロキシ鍵 (Function の PROXY_KEY と一致させる / 任意)</label>
   <input id="proxyKey" placeholder="空なら誰でも使える">
-  <label>上流プロキシ (1行1個 / host:port または host:port:user:pass)</label>
-  <textarea id="proxyList" rows="4" placeholder="127.0.0.1:8080&#10;1.2.3.4:3128:user:pass"></textarea>
+  <label>上流プロキシ (1行1個 / host:port / host:port:user:pass / {session} 展開可)</label>
+  <textarea id="proxyList" rows="5" placeholder="127.0.0.1:8080&#10;1.2.3.4:3128:user:pass&#10;gate.example.com:8000:user:{session}"></textarea>
   <div class="chk"><input type="checkbox" id="proxyOn"><span>上流プロキシを使う (Function経由のときのみ有効)</span></div>
   <div class="chk"><input type="checkbox" id="autoPurge" checked><span>401 のトークンを自動でリストから消す</span></div>
 
   <details>
     <summary>netlify/functions/proxy.js のコード</summary>
     <pre id="workerCode">const ALLOW = ['discord.com', 'discordapp.com', 'api.mail.tm', 'click.discord.com',
-               'cdn.discordapp.com', '2captcha.com', 'api.yescaptcha.com'];
+               'cdn.discordapp.com', '2captcha.com', 'api.yescaptcha.com',
+               'api.proxyscrape.com', 'api.ipify.org', 'raw.githubusercontent.com',
+               'proxylist.geonode.com'];
 const FWD = ['content-type', 'authorization', 'x-super-properties', 'x-discord-locale',
              'x-discord-timezone', 'user-agent', 'accept', 'accept-language',
              'proxy-authorization', 'x-upstream-proxy', 'x-discord-cookie',
@@ -346,7 +360,7 @@ async function acquireIp(){
     const now=Date.now();
     const cands=list.filter(p=>{const s=stateOf(ipKey(p));
       return s.used<maxPer && now>=s.until && now-s.last>=gapMs});
-    if(cands.length)return useProxy?pick(cands):null;
+    if(cands.length)return useProxy?expandProxy(pick(cands)):null;
     const waits=list.map(p=>{const s=stateOf(ipKey(p));
       return Math.max(s.until-now, s.last+gapMs-now)}).filter(x=>x>0);
     const w=waits.length?Math.min(...waits):1500;
@@ -354,7 +368,7 @@ async function acquireIp(){
     log((useProxy?'IP 待ち ':'間隔待ち ')+Math.ceil(w/1000)+'s','ld');
     await sleep(Math.min(w+300,20000));
   }
-  return useProxy?pick(list):null;
+  return useProxy?expandProxy(pick(list)):null;
 }
 function releaseIp(ip,mode){
   const s=stateOf(ipKey(ip));
@@ -405,9 +419,12 @@ function proxyEndpoint(){return $('#proxyUrl').value.trim()}
 function proxyKey(){return $('#proxyKey').value.trim()}
 function withKey(u){const k=proxyKey();return k?u+(u.includes('?')?'&':'?')+'key='+encodeURIComponent(k):u}
 function proxyList(){return $('#proxyList').value.split('\n').map(x=>x.trim()).filter(Boolean)}
+function expandProxy(p){
+  return p.replace(/\{session\}/gi,()=>randStr(8)).replace(/\{rand\}/gi,()=>String(rnd(100000,999999)));
+}
 function pickUpstream(){
   const l=proxyList();
-  return l.length?pick(l):null;
+  return l.length?expandProxy(pick(l)):null;
 }
 function parseProxy(p){
   const [h,port,user,...rest]=p.split(':');
@@ -457,6 +474,65 @@ async function dfetch(path,opt={}){
     return{status:r.status,body:j,text:txt,headers:r.headers};
   }
   return{status:0,body:null};
+}
+
+/* ---------- プロキシ自動取得 ---------- */
+let pOk=0,pNg=0;
+async function checkProxy(p){
+  const ep=proxyEndpoint();if(!ep)return null;
+  const url=withKey(ep+(ep.includes('?')?'&':'?')+'url='+encodeURIComponent('https://api.ipify.org?format=json'));
+  const ctl=new AbortController();
+  const t=setTimeout(()=>ctl.abort(),9000);
+  try{
+    const r=await fetch(url,{headers:{'X-Upstream-Proxy':p},signal:ctl.signal});
+    if(!r.ok)return null;
+    const j=await r.json();
+    return j&&j.ip?j.ip:null;
+  }catch(e){return null}
+  finally{clearTimeout(t)}
+}
+async function loadAutoProxies(){
+  const srcs=$('#proxySrc').value.split('\n').map(x=>x.trim()).filter(Boolean);
+  if(!srcs.length){log('取得元 URL が空','le');return}
+  if(!proxyEndpoint()){log('プロキシエンドポイントが空','le');return}
+  const want=Math.max(1,+$('#proxyWant').value||20);
+  const conc=Math.max(1,+$('#proxyCheckConc').value||8);
+  const have=new Set(proxyList());
+  const cands=[];
+  for(const s of srcs){
+    try{
+      const r=await ext(s);
+      const lines=(r.text||'').split(/\r?\n/).map(x=>x.trim())
+        .map(x=>x.replace(/^[a-z]+:\/\//i,'').replace(/\/.*$/,''))
+        .filter(x=>/^[\w.\-]+:\d{2,5}(:[\w.\-]+:[\w.\-]+)?$/.test(x));
+      for(const l of lines)if(!have.has(l)&&!cands.includes(l))cands.push(l);
+      log('取得元 '+new URL(s).hostname+' → '+lines.length+' 件','ld');
+    }catch(e){log('取得失敗 '+s+' ('+e.message+')','lw')}
+  }
+  if(!cands.length){log('候補が 0 件','lw');return}
+  log('検証開始 候補 '+cands.length+' 件 / 目標 '+want+' 本','ld');
+  const got=[];const seenIp=new Set();
+  let idx=0;
+  const worker=async()=>{
+    while(got.length<want&&idx<cands.length&&!stopped){
+      const p=cands[idx++];
+      const ip=await checkProxy(p);
+      if(ip&&!seenIp.has(ip)){
+        seenIp.add(ip);got.push(p);pOk++;$('#pOk').textContent=pOk;
+        log('合格 '+p+' → '+ip,'lg');
+      }else{
+        pNg++;$('#pNg').textContent=pNg;
+      }
+    }
+  };
+  await Promise.all(Array.from({length:Math.min(conc,cands.length)},worker));
+  if(!got.length){log('有効なプロキシが 0 本。取得元を変えてください','le');return}
+  const merged=proxyList().concat(got);
+  $('#proxyList').value=merged.join('\n');
+  $('#proxyOn').checked=true;
+  localStorage.setItem('dts_proxyList',$('#proxyList').value);
+  localStorage.setItem('dts_proxyOn','1');
+  log('プールに '+got.length+' 本を追加（合計 '+merged.length+' 本）','lg');
 }
 
 /* ---------- token import ---------- */
@@ -533,7 +609,6 @@ function capHeaders(c, token){
   return h;
 }
 
-// タスク作成は一時エラー (SERVICE_NOT_AVAILABLE 等) で落ちることがあるので数回粘る
 async function createTask(BASE,key,task){
   let last='unknown';
   for(let i=0;i<3;i++){
@@ -795,6 +870,10 @@ async function runGen(){
   const total=+$('#genCount').value,conc=+$('#genConc').value,gap=+$('#genGap').value;
   if(!proxyEndpoint()&&$('#useEmail').checked){log('プロキシ未設定: メール作成が CORS で失敗します','lw')}
   if(!hasKey())log('captcha キー未設定: captcha で止まります','lw');
+  if(!proxyActive()&&$('#autoProxy').checked){
+    log('プロキシ未設定 → 自動取得します','ld');
+    await loadAutoProxies();
+  }
   if(proxyActive())log('プロキシ '+proxyList().length+' 本で開始','ld');
   else log('プロキシ未設定 → 自回線 1 本で実行（'+$('#ipGap').value+' 秒間隔 / '+$('#ipCool').value+' 分クールダウン適用）','lw');
   let started=0,done=0;
@@ -956,8 +1035,15 @@ $('#btnFetch').onclick=fetchChannels;
 $('#btnImport').onclick=async()=>{$('#btnImport').disabled=true;try{await importTokens()}finally{$('#btnImport').disabled=false}};
 $('#btnCopy').onclick=()=>{navigator.clipboard.writeText(tokens.map(o=>o.t).join('\n'));log('コピーしました','ld')};
 $('#btnClear').onclick=()=>{tokens=[];save();renderTokens();log('トークン消去','ld')};
+$('#btnProxyLoad').onclick=async()=>{$('#btnProxyLoad').disabled=true;try{await loadAutoProxies()}finally{$('#btnProxyLoad').disabled=false}};
+$('#btnProxyClear').onclick=()=>{
+  $('#proxyList').value='';
+  localStorage.setItem('dts_proxyList','');
+  $('#pOk').textContent='0';$('#pNg').textContent='0';
+  log('プロキシ一覧を消去','ld');
+};
 
-['proxyUrl','proxyKey','capKey','capProv','capUseProxy','proxyList','proxyOn','autoPurge','msg','spamCount','spamGap','spamJitter','spamConc','chanOrder','spamRetry','randMsg','genCount','genConc','genGap','useEmail','joinConc','joinGap','joinSkip','guildId','chanIds','inviteCode','importVerify','stickyIp','ipMax','ipCool','ipGap','rateCool','preflight','fpSpoof']
+['proxyUrl','proxyKey','capKey','capProv','capUseProxy','proxyList','proxyOn','autoPurge','msg','spamCount','spamGap','spamJitter','spamConc','chanOrder','spamRetry','randMsg','genCount','genConc','genGap','useEmail','joinConc','joinGap','joinSkip','guildId','chanIds','inviteCode','importVerify','stickyIp','ipMax','ipCool','ipGap','rateCool','preflight','fpSpoof','autoProxy','proxySrc','proxyWant','proxyCheckConc']
 .forEach(id=>{const el=$('#'+id);const k='dts_'+id;
   const v=localStorage.getItem(k);
   if(v!==null){if(el.type==='checkbox')el.checked=v==='1';else el.value=v}
