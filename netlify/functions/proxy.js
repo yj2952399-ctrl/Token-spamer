@@ -1,7 +1,8 @@
 const ALLOW = ['discord.com', 'discordapp.com', 'api.mail.tm', 'click.discord.com',
                'cdn.discordapp.com', '2captcha.com', 'api.yescaptcha.com'];
 const FWD = ['content-type', 'authorization', 'x-super-properties', 'x-discord-locale',
-             'x-discord-timezone', 'user-agent', 'proxy-authorization', 'x-upstream-proxy',
+             'x-discord-timezone', 'user-agent', 'accept', 'accept-language',
+             'proxy-authorization', 'x-upstream-proxy', 'x-discord-cookie',
              'x-captcha-key', 'x-captcha-rqtoken', 'x-captcha-session-id', 'x-captcha-rqdata'];
 
 const cors = {
@@ -24,6 +25,7 @@ exports.handler = async (event) => {
 
   const headers = {};
   for (const k of FWD) if (event.headers[k]) headers[k] = event.headers[k];
+  if (headers['x-discord-cookie']) headers.cookie = headers['x-discord-cookie'];
 
   const raw = event.body || '';
   const buf = event.isBase64Encoded ? Buffer.from(raw, 'base64') : Buffer.from(raw, 'utf8');
