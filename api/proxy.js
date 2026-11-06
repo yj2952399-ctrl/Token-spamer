@@ -1,15 +1,17 @@
 const ALLOW = new Set([
   'discord.com', 'discordapp.com', 'cdn.discordapp.com', 'click.discord.com',
-  'api.mail.tm', '2captcha.com', 'api.yescaptcha.com',
+  'api.mail.tm', 'api.mail.gw', '2captcha.com', 'api.yescaptcha.com',
   'api.proxyscrape.com', 'api.ipify.org', 'raw.githubusercontent.com',
-  'proxylist.geonode.com',
+  'proxylist.geonode.com', 'api.openproxylist.xyz', 'www.proxy-list.download',
+  'proxy-list.download',
 ]);
 
 const FWD = [
   'content-type', 'authorization', 'x-super-properties', 'x-discord-locale',
   'x-discord-timezone', 'user-agent', 'accept', 'accept-language', 'cookie',
   'x-discord-cookie', 'x-fingerprint', 'x-captcha-key', 'x-captcha-rqtoken',
-  'x-captcha-session-id', 'x-captcha-rqdata',
+  'x-captcha-session-id', 'x-captcha-rqdata', 'origin', 'referer',
+  'x-debug-options', 'x-discord-client-properties', 'priority',
 ];
 
 const HOP = new Set([
@@ -28,7 +30,6 @@ const EXPOSE = [
   'x-captcha-session-id',
 ].join(', ');
 
-// Vercel に body をパースさせない（パースされると fetch に渡せない）
 export const config = { api: { bodyParser: false } };
 
 function corsHeaders(res) {
@@ -43,6 +44,17 @@ async function readRaw(req) {
   const chunks = [];
   for await (const c of req) chunks.push(c);
   return Buffer.concat(chunks);
+}
+
+let ProxyAgentCls = null;
+async function agentFor(up) {
+  if (!up) return undefined;
+  if (!ProxyAgentCls) {
+    try { ({ ProxyAgent: ProxyAgentCls } = await import('undici')); } catch { return undefined; }
+  }
+  const [h, p, user, pass] = up.split(':');
+  const auth = user ? `${encodeURIComponent(user)}:${encodeURIComponent(pass || '')}@` : '';
+  return new ProxyAgentCls(`http://${auth}${h}:${p}`);
 }
 
 export default async function handler(req, res) {
@@ -63,9 +75,10 @@ export default async function handler(req, res) {
   for (const k of FWD) if (req.headers[k]) headers[k] = req.headers[k];
   if (headers['x-discord-cookie']) headers.cookie = headers['x-discord-cookie'];
 
-  let dest = t.toString();
   const up = req.headers['x-upstream-proxy'];
-  if (up) {
+  const dispatcher = await agentFor(up);
+  let dest = t.toString();
+  if (up && !dispatcher) {
     const [h, p, user, pass] = up.split(':');
     if (h && p) {
       dest = `http://${h}:${p}${t.pathname}${t.search}`;
@@ -81,7 +94,14 @@ export default async function handler(req, res) {
 
   let r;
   try {
-    r = await fetch(dest, { method: req.method, headers, body, signal: ctl.signal, redirect: 'manual' });
+    r = await fetch(dest, {
+      method: req.method,
+      headers,
+      body,
+      signal: ctl.signal,
+      redirect: 'manual',
+      ...(dispatcher ? { dispatcher } : {}),
+    });
   } catch (e) {
     return res.status(502).json({ error: 'upstream: ' + String(e) });
   } finally {
