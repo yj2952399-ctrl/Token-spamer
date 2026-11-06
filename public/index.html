@@ -63,7 +63,11 @@
     overflow-x:auto;font-size:11px;font-family:ui-monospace,monospace;margin:8px 0}
   .chk{display:flex;align-items:center;gap:7px;font-size:12px;color:var(--host-fg);margin-top:10px}
   .chk input{width:auto}
+  .chk-list{display:flex;flex-wrap:wrap;gap:6px 16px;margin-top:8px}
+  .chk-list label{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--host-fg);margin:0}
+  .chk-list input{width:auto}
   .hint{font-size:11px;color:var(--host-fg-muted);margin-top:4px}
+  #probeOut{white-space:pre-wrap;font-family:ui-monospace,monospace;font-size:11px}
   .warn{background:var(--host-card);border:1px solid #d97706;border-radius:8px;padding:8px 10px;
     font-size:11px;color:var(--host-fg);margin-top:10px}
 </style>
@@ -87,9 +91,9 @@
   <div class="row">
     <div><label>作るアカウント数</label><input id="genCount" type="number" value="10" min="1" max="500"></div>
     <div><label>同時実行</label><input id="genConc" type="number" value="1" min="1" max="10"></div>
-    <div><label>試行間隔 (ms)</label><input id="genGap" type="number" value="2000" min="0" max="60000"></div>
+    <div><label>試行間隔 (ms)</label><input id="genGap" type="number" value="3000" min="0" max="60000"></div>
   </div>
-  <div class="chk"><input type="checkbox" id="useEmail" checked><span>メール認証まで自動でやる (mail.tm / mail.gw / プロキシ必須)</span></div>
+  <div class="chk"><input type="checkbox" id="useEmail" checked><span>メール認証まで自動でやる (複数プロバイダ / プロキシ必須)</span></div>
   <div class="hint">プロキシは成功率で自動的に重み付けされます。通らない IP は自動で隔離・除外されるので、最初に多めに入れておくと後半が安定します。</div>
   <div class="btns">
     <button class="btn" id="btnGen">生成開始</button>
@@ -168,6 +172,20 @@
   <p class="hint">captcha が出たときだけ使います。2captcha は hCaptcha 1件 約 $0.001〜0.003、10〜30秒。YesCaptcha は 1件30ポイント。入力・変更するとログに残ります。</p>
   <div class="chk"><input type="checkbox" id="capUseProxy" checked><span>captcha も上流プロキシ経由で解く（IP を揃える / これが OFF だと UNSOLVABLE になりやすい）</span></div>
 
+  <h3>メールプロバイダ</h3>
+  <p class="hint">上から順に試します。連続失敗したプロバイダは自動で15分隔離、枯れたドメインは30分隔離されます。全部死んだら「mail 全滅」で即座に次のアカウントへ移ります。</p>
+  <div class="chk-list" id="mailProvs"></div>
+  <div class="chk"><input type="checkbox" id="provShuffle"><span>プロバイダの順序を毎回シャッフルする（偏りを散らす）</span></div>
+
+  <label>優先ドメイン（1行1個 / 空なら自動選択 / provider名:ドメイン で特定プロバイダ固定）</label>
+  <textarea id="mailUse" rows="4" placeholder="binkmail.com&#10;tempmail.lol:xxxx.lol"></textarea>
+  <label>使わないドメイン（1行1個 / 恒久的に除外）</label>
+  <textarea id="mailBan" rows="3" placeholder="f1dubai.com"></textarea>
+  <div class="chk"><input type="checkbox" id="recoverOnDup"><span>既登録だった場合にパスワードリセットでの回収も試す（captcha を消費するので既定OFF）</span></div>
+  <div class="btns"><button class="btn sec" id="btnProbe">ドメイン生存確認</button></div>
+  <p class="hint">生存確認は各ドメインで preflight を1回だけ叩き、captcha 要求が返れば生存、EMAIL_ALREADY_REGISTERED なら枯れと判定します。生存ドメインは優先リストへ自動反映、枯れは自動除外します。</p>
+  <div class="hint" id="probeOut"></div>
+
   <h3>プロキシ自動取得</h3>
   <div class="chk"><input type="checkbox" id="autoProxy"><span>プロキシを自動取得・検証して使う（未設定時のみ起動）</span></div>
   <label>取得元 URL（1行1個 / host:port 形式を返すもの）</label>
@@ -191,7 +209,7 @@ https://api.openproxylist.xyz/http.txt</textarea>
   </div>
   <div class="row">
     <div><label>同一 IP の最小間隔 (秒)</label><input id="ipGap" type="number" value="120" min="0" max="3600"></div>
-    <div><label>登録APIの最小間隔 (秒)</label><input id="regGap" type="number" value="20" min="5" max="3600"></div>
+    <div><label>登録APIの最小間隔 (秒)</label><input id="regGap" type="number" value="30" min="5" max="3600"></div>
   </div>
   <div class="row">
     <div><label>429 時の冷却 (秒)</label><input id="rateCool" type="number" value="300" min="60" max="3600"></div>
@@ -212,10 +230,14 @@ https://api.openproxylist.xyz/http.txt</textarea>
   <div class="chk"><input type="checkbox" id="autoPurge" checked><span>401 のトークンを自動でリストから消す</span></div>
 
   <details>
-    <summary>netlify/functions/proxy.js のコード</summary>
+    <summary>netlify/functions/proxy.js のコード（ALLOW を全プロバイダ分に更新済み）</summary>
     <pre id="workerCode">const ALLOW = new Set([
   'discord.com', 'discordapp.com', 'cdn.discordapp.com', 'click.discord.com',
-  'api.mail.tm', 'api.mail.gw', '2captcha.com', 'api.yescaptcha.com',
+  // mail providers
+  'api.mail.tm', 'api.mail.gw', 'api.tempmail.lol', 'tempmail.plus',
+  'api.maildrop.cc', 'web2.temp-mail.org', 'api.guerrillamail.com',
+  // captcha / proxy sources
+  '2captcha.com', 'api.yescaptcha.com',
   'api.proxyscrape.com', 'api.ipify.org', 'raw.githubusercontent.com',
   'proxylist.geonode.com', 'api.openproxylist.xyz', 'www.proxy-list.download',
   'proxy-list.download',
@@ -341,6 +363,7 @@ exports.handler = async (event) =&gt; {
   };
 };</pre>
   </details>
+  <p class="hint">Cloudflare 版 (<code>functions/api/proxy.js</code>) と Vercel 版 (<code>api/proxy.js</code>) の ALLOW も同じ内容に揃えてください。揃えないと追加プロバイダだけ 403 になります。</p>
 </div>
 
 <h3>ログ</h3>
@@ -431,7 +454,7 @@ function ipFor(opt){
   if($('#stickyIp').checked&&opt&&opt.ip!==undefined&&opt.ip!==null)return opt.ip;
   return pickUpstream();
 }
-const regGapMs=()=>num('#regGap',20,5,3600)*1000;
+const regGapMs=()=>num('#regGap',30,5,3600)*1000;
 
 function ipWeight(k){
   const s=ipState(k);
@@ -473,7 +496,6 @@ async function acquireIp(){
     const cands=list.filter(p=>usable(p,now,maxPer,gapMs));
     if(cands.length)return useProxy?expandProxy(pickWeighted(cands)):null;
 
-    // 全滅に近いなら隔離を一時解除してでも進む
     const soft=list.filter(p=>{const s=ipState(ipKey(p));
       return s.used<maxPer&&now>=s.coolUntil&&now>=s.nextAt+gapMs});
     if(soft.length&&spin%12===11){
@@ -598,8 +620,6 @@ function pageFor(path){
   return 'https://discord.com/app';
 }
 
-// 429 は「そのIPの冷却を立てて、基本は呼び出し元に返す」。
-// POST は既定でリトライしない（二重送信を避ける）。GET だけ2回まで。
 async function dfetch(path,opt={}){
   const method=opt.method||'GET';
   const isReg=!!opt.isReg||/^\/auth\/(register|login|forgot|verify|reset)/.test(path);
@@ -666,7 +686,7 @@ async function dfetch(path,opt={}){
   }
 }
 
-/* ---------- プロキシ自動取得（Discord 実疎通で検証） ---------- */
+/* ---------- プロキシ自動取得 ---------- */
 let pOk=0,pNg=0;
 async function checkProxy(p){
   const ep=proxyEndpoint();if(!ep)return null;
@@ -888,121 +908,347 @@ async function solveCaptcha(ch,pageurl,ip,prof){
   throw new Error('solver timeout');
 }
 
-/* ---------- 使い捨てメール（ドメイン学習つき） ---------- */
-const MAIL_PROVIDERS=[
-  {name:'mail.gw', base:'https://api.mail.gw'},
-  {name:'mail.tm', base:'https://api.mail.tm'}
-];
-const DOMAIN_FALLBACK={
-  'https://api.mail.gw':['mail.gw','playpc.io','dragonmail.live','binkmail.com'],
-  'https://api.mail.tm':['mail.tm','punkproof.com','bestsoundeffects.com','uorak.com','email-temp.com']
-};
-const domainCache={};
-const badDomains=new Map();
-const domUsable=d=>{const u=badDomains.get(d);return !u||Date.now()>u};
-function markBadDomain(d){badDomains.set(d,Date.now()+30*60000);log('ドメイン隔離: '+d,'ld')}
+/* ================= メールプロバイダ（アダプタ） =================
+   各アダプタは domains(ip) / create(ip,dom) / list(mail) を実装する。
+   create は成功で {address, token}、429 で {rate:true}、
+   ドメイン起因の失敗で {badDomain:true}、その他失敗で {status, text} を返す。
+   list は [{id, subject, raw}] を返す（raw は本文+HTMLを連結したもの）。 */
 
-async function mailReq(base,path,opt={}){
+async function api(url,opt={}){
   const ep=proxyEndpoint();if(!ep)throw new Error('no proxy');
-  const url=withKey(ep+(ep.includes('?')?'&':'?')+'url='+encodeURIComponent(base+path));
-  const h={'Content-Type':'application/json','Accept':'application/ld+json, application/json'};
-  if(opt.token)h.Authorization='Bearer '+opt.token;
+  const u=withKey(ep+(ep.includes('?')?'&':'?')+'url='+encodeURIComponent(url));
+  const h={'Accept':'application/json, text/plain, */*'};
+  if(opt.ctype)h['Content-Type']=opt.ctype;
+  if(opt.token)h['Authorization']=opt.token;
   if(opt.ip)h['X-Upstream-Proxy']=opt.ip;
-  const r=await fetch(url,{method:opt.method||'GET',headers:h,body:opt.body});
+  const r=await fetch(u,{method:opt.method||'GET',headers:h,body:opt.body});
   const t=await r.text();let j=null;try{j=JSON.parse(t)}catch(e){}
   return{status:r.status,body:j,text:t};
 }
 
-async function mailDomainsOf(base){
-  if(domainCache[base]){
-    const fresh=domainCache[base].filter(domUsable);
-    if(fresh.length)return fresh;
+const MAIL_PROVIDERS=[
+  {
+    id:'tempmail.lol',name:'tempmail.lol',base:'https://api.tempmail.lol',on:true,
+    async domains(ip){
+      const r=await api(this.base+'/v2/domains',{ip});
+      const a=Array.isArray(r.body)?r.body:(r.body&&r.body.domains)||[];
+      return a.map(x=>typeof x==='string'?x:(x&&x.domain)).filter(Boolean);
+    },
+    async create(ip,dom){
+      const r=await api(this.base+'/v2/inbox/create',{method:'POST',ip,ctype:'application/json',
+        body:JSON.stringify(dom?{domain:dom}:{})});
+      if(r.status===429)return{rate:true};
+      if(r.status===422||r.status===400)return{badDomain:true};
+      const b=r.body||{};
+      if(!b.address)return{status:r.status,text:r.text};
+      return{address:b.address,token:b.token};
+    },
+    async list(mail){
+      const r=await api(this.base+'/v2/inbox?token='+encodeURIComponent(mail.token),{ip:mail.ip});
+      const arr=(r.body&&r.body.emails)||[];
+      return arr.map((m,i)=>({id:String(i),subject:m.subject||'',
+        raw:[m.subject,m.body,m.html].filter(Boolean).join('\n')}));
+    }
+  },
+  {
+    id:'tempmail.plus',name:'tempmail.plus',base:'https://tempmail.plus',on:true,
+    async domains(){
+      return ['mailto.plus','fexpost.com','fexbox.org','mailbox.in.ua','rover.info',
+              'chitthi.in','fextemp.com','any.pink','merepost.com'];
+    },
+    async create(ip,dom){
+      const local=randStr(12);
+      const epin=String(rnd(100000,999999));
+      return{address:local+'@'+(dom||'mailto.plus'),token:epin,local};
+    },
+    async list(mail){
+      const q='?email='+encodeURIComponent(mail.local||mail.address.split('@')[0])+
+        '&epin='+encodeURIComponent(mail.token)+'&limit=20';
+      const r=await api(this.base+'/api/mails'+q,{ip:mail.ip});
+      const arr=(r.body&&(r.body.mail_list||r.body.mails))||[];
+      const out=[];
+      for(const m of arr){
+        const d=await api(this.base+'/api/mails/'+encodeURIComponent(m.mail_id)+q,{ip:mail.ip});
+        const b=d.body||{};
+        out.push({id:m.mail_id,subject:b.subject||m.subject||'',
+          raw:[b.subject,m.subject,b.text,b.html].filter(Boolean).join('\n')});
+      }
+      return out;
+    }
+  },
+  {
+    id:'mail.gw',name:'mail.gw (Mercure)',base:'https://api.mail.gw',on:true,
+    async domains(ip){
+      const r=await api(this.base+'/domains?page=1',{ip});
+      const a=(r.body&&(r.body['hydra:member']||r.body.member))||[];
+      return a.map(x=>x&&x.domain).filter(Boolean);
+    },
+    async create(ip,dom){
+      const addr=randStr(20)+'@'+dom;
+      const pw=randStr(14)+'Aa1!';
+      const c=await api(this.base+'/accounts',{method:'POST',ip,ctype:'application/json',
+        body:JSON.stringify({address:addr,password:pw})});
+      if(c.status===429)return{rate:true};
+      if(c.status===422||c.status===400||c.status===404)return{badDomain:true};
+      if(c.status!==201)return{status:c.status,text:c.text};
+      const tk=await api(this.base+'/token',{method:'POST',ip,ctype:'application/json',
+        body:JSON.stringify({address:addr,password:pw})});
+      if(!tk.body||!tk.body.token)return{status:tk.status,text:tk.text};
+      return{address:addr,token:tk.body.token};
+    },
+    async list(mail){
+      const l=await api(mail.base+'/messages',{token:'Bearer '+mail.token,ip:mail.ip});
+      const arr=(l.body&&(l.body['hydra:member']||l.body.member))||[];
+      const out=[];
+      for(const m of arr){
+        const d=await api(mail.base+'/messages/'+m.id,{token:'Bearer '+mail.token,ip:mail.ip});
+        out.push({id:m.id,subject:m.subject||'',raw:JSON.stringify(d.body||{})});
+      }
+      return out;
+    }
+  },
+  {
+    id:'maildrop.cc',name:'maildrop.cc',base:'https://api.maildrop.cc',on:true,
+    async domains(){return['maildrop.cc']},
+    async create(ip,dom){
+      return{address:randStr(12)+'@'+(dom||'maildrop.cc')};
+    },
+    async list(mail){
+      const local=mail.address.split('@')[0];
+      const r=await api(this.base+'/graphql',{method:'POST',ip,ctype:'application/json',
+        body:JSON.stringify({query:'query($m:String!){inbox(mailbox:$m){id subject data}}',
+          variables:{m:local}})});
+      const arr=(r.body&&r.body.data&&r.body.data.inbox)||[];
+      return arr.map(m=>({id:m.id,subject:m.subject||'',raw:[m.subject,m.data].filter(Boolean).join('\n')}));
+    }
+  },
+  {
+    id:'guerrillamail',name:'guerrillamail',base:'https://api.guerrillamail.com/ajax.php',on:true,
+    async domains(){
+      return['guerrillamail.com','sharklasers.com','guerrillamailblock.com','grr.la',
+             'guerrillamail.info','guerrillamail.biz','guerrillamail.de','guerrillamail.net',
+             'guerrillamail.org','spam4.me','pokemail.net'];
+    },
+    async create(ip){
+      const r=await api(this.base+'?f=get_email_address&lang=en&ip=127.0.0.1&agent=chrome',{ip});
+      const b=r.body||{};
+      if(r.status===429)return{rate:true};
+      if(!b.email_addr)return{status:r.status,text:r.text};
+      return{address:b.email_addr,token:b.sid_token};
+    },
+    async list(mail){
+      const r=await api(this.base+'?f=check_email&seq=0&sid_token='+encodeURIComponent(mail.token),{ip:mail.ip});
+      const arr=(r.body&&r.body.list)||[];
+      const out=[];
+      for(const m of arr){
+        const d=await api(this.base+'?f=fetch_email&email_id='+encodeURIComponent(m.mail_id)+
+          '&sid_token='+encodeURIComponent(mail.token),{ip:mail.ip});
+        const b=d.body||{};
+        out.push({id:m.mail_id,subject:b.mail_subject||m.mail_subject||'',
+          raw:[b.mail_subject,m.mail_subject,b.mail_body].filter(Boolean).join('\n')});
+      }
+      return out;
+    }
+  },
+  {
+    id:'temp-mail.org',name:'temp-mail.org',base:'https://web2.temp-mail.org',on:false,
+    async domains(ip){
+      const r=await api(this.base+'/domains',{ip});
+      return (r.body&&r.body.domains)||[];
+    },
+    async create(ip){
+      const r=await api(this.base+'/mailbox',{method:'POST',ip,ctype:'application/json',body:'{}'});
+      if(r.status===429)return{rate:true};
+      const b=r.body||{};
+      if(!b.token)return{status:r.status,text:r.text};
+      return{address:b.mailbox,token:b.token};
+    },
+    async list(mail){
+      const r=await api(this.base+'/messages',{ip:mail.ip,token:'Bearer '+mail.token});
+      const arr=(r.body&&r.body.messages)||[];
+      return arr.map(m=>({id:m._id,subject:m.subject||'',raw:[m.subject,m.body].filter(Boolean).join('\n')}));
+    }
+  },
+  {
+    id:'mail.tm',name:'mail.tm (Mercure)',base:'https://api.mail.tm',on:false,
+    async domains(ip){
+      const r=await api(this.base+'/domains?page=1',{ip});
+      const a=(r.body&&(r.body['hydra:member']||r.body.member))||[];
+      return a.map(x=>x&&x.domain).filter(Boolean);
+    },
+    async create(ip,dom){
+      const addr=randStr(20)+'@'+dom;
+      const pw=randStr(14)+'Aa1!';
+      const c=await api(this.base+'/accounts',{method:'POST',ip,ctype:'application/json',
+        body:JSON.stringify({address:addr,password:pw})});
+      if(c.status===429)return{rate:true};
+      if(c.status===422||c.status===400||c.status===404)return{badDomain:true};
+      if(c.status!==201)return{status:c.status,text:c.text};
+      const tk=await api(this.base+'/token',{method:'POST',ip,ctype:'application/json',
+        body:JSON.stringify({address:addr,password:pw})});
+      if(!tk.body||!tk.body.token)return{status:tk.status,text:tk.text};
+      return{address:addr,token:tk.body.token};
+    },
+    async list(mail){
+      const l=await api(mail.base+'/messages',{token:'Bearer '+mail.token,ip:mail.ip});
+      const arr=(l.body&&(l.body['hydra:member']||l.body.member))||[];
+      const out=[];
+      for(const m of arr){
+        const d=await api(mail.base+'/messages/'+m.id,{token:'Bearer '+mail.token,ip:mail.ip});
+        out.push({id:m.id,subject:m.subject||'',raw:JSON.stringify(d.body||{})});
+      }
+      return out;
+    }
   }
-  for(let i=0;i<3;i++){
-    const d=await mailReq(base,'/domains?page=1');
-    const arr=(d.body&&(d.body['hydra:member']||d.body['member']||(Array.isArray(d.body)?d.body:[])))||[];
-    const doms=arr.map(x=>x&&x.domain).filter(Boolean).filter(domUsable);
-    if(doms.length){domainCache[base]=doms;return doms}
-    log('domain 取得失敗 '+new URL(base).hostname+' HTTP '+d.status+' '+
-      String(d.text||'').replace(/\s+/g,' ').slice(0,70),'lw');
-    await sleep(1500*(i+1));
+];
+const PROV=Object.fromEntries(MAIL_PROVIDERS.map(p=>[p.id,p]));
+
+const DOMAIN_FALLBACK={
+  'mail.gw':['mail.gw','playpc.io','dragonmail.live','binkmail.com'],
+  'mail.tm':['punkproof.com','bestsoundeffects.com','uorak.com']
+};
+const HARD_BURNED=['f1dubai.com','email-temp.com','mail.tm'];
+const domainCache={};
+const badDomains=new Map();
+const pvState=new Map();
+
+function splitList(v){return v.split(/[\s,]+/).map(x=>x.trim().toLowerCase()).filter(Boolean)}
+function bannedDomains(){return new Set([...HARD_BURNED,...splitList($('#mailBan').value)])}
+function preferredDomains(){
+  return splitList($('#mailUse').value).map(x=>{
+    const i=x.indexOf(':');
+    return i>0?{prov:x.slice(0,i),dom:x.slice(i+1)}:{prov:'',dom:x};
+  }).filter(o=>o.dom);
+}
+const domUsable=d=>{
+  if(!d)return false;
+  if(bannedDomains().has(d))return false;
+  const u=badDomains.get(d);
+  return !u||Date.now()>u;
+};
+function markBadDomain(d){
+  if(!d)return;
+  d=d.toLowerCase();
+  if(badDomains.has(d)&&Date.now()<badDomains.get(d))return;
+  badDomains.set(d,Date.now()+30*60000);
+  for(const k in domainCache)domainCache[k]=domainCache[k].filter(x=>x!==d);
+  log('ドメイン隔離: '+d,'ld');
+}
+
+function pvOf(id){let s=pvState.get(id);if(!s){s={ng:0,ok:0,coolUntil:0};pvState.set(id,s)}return s}
+function pvOk(p){const s=pvOf(p.id);s.ng=0;s.ok++}
+function pvFail(p,why){
+  const s=pvOf(p.id);s.ng++;
+  if(s.ng>=3){s.coolUntil=Date.now()+15*60000;s.ng=0;log('プロバイダ隔離: '+p.id+' ('+why+')','lw')}
+}
+function enabledProviders(){
+  const banned=new Set(); // 予約
+  const list=MAIL_PROVIDERS.filter(p=>p.on&&Date.now()>=pvOf(p.id).coolUntil);
+  if(!list.length)return [];
+  const score=p=>{const s=pvOf(p.id);return (s.ok+1)/(s.ok+s.ng+2)};
+  list.sort((a,b)=>score(b)-score(a));
+  if($('#provShuffle').checked){
+    for(let i=list.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[list[i],list[j]]=[list[j],list[i]]}
   }
-  return [];
+  return list;
+}
+
+async function provDomains(p,ip){
+  let doms=[];
+  try{doms=await p.domains(ip)}catch(e){}
+  if(!doms.length)doms=DOMAIN_FALLBACK[p.id]||[];
+  const pref=preferredDomains().filter(o=>!o.prov||o.prov===p.id).map(o=>o.dom);
+  if(pref.length)doms=pref.concat(doms);
+  return [...new Set(doms.map(x=>String(x).toLowerCase()))].filter(domUsable);
 }
 
 async function makeMail(ip){
-  const order=[...MAIL_PROVIDERS].sort(()=>Math.random()-.5);
+  const order=enabledProviders();
+  if(!order.length)throw new Error('有効なメールプロバイダが 0 件（設定タブで有効化）');
   for(const p of order){
-    let doms=[];
-    try{doms=await mailDomainsOf(p.base)}catch(e){}
-    if(!doms.length)doms=(DOMAIN_FALLBACK[p.base]||[]).filter(domUsable);
-    if(!doms.length)continue;
-
-    for(let a=0;a<6;a++){
-      const dom=pick(doms);
-      const addr=randStr(20)+'@'+dom;
-      const pw=randStr(14)+'Aa1!';
-      const c=await mailReq(p.base,'/accounts',{method:'POST',ip,
-        body:JSON.stringify({address:addr,password:pw})});
-      if(c.status===429){log('mail 429 → 待機','lw');await sleep(4000);continue}
-      if(c.status===422||c.status===400||c.status===404){markBadDomain(dom);continue}
-      if(c.status!==201){
-        log('mail 作成不可 '+p.name+' HTTP '+c.status+' '+
-          String(c.text||'').replace(/\s+/g,' ').slice(0,70),'lw');
-        break;
+    const doms=await provDomains(p,ip);
+    if(!doms.length){pvFail(p,'ドメイン 0');continue}
+    let rateHit=0;
+    let live=[...doms];
+    for(let a=0;a<4&&live.length;){
+      const dom=pick(live);
+      let res;
+      try{res=await p.create(ip,dom)}
+      catch(e){pvFail(p,e.message);break}
+      if(res.rate){
+        rateHit++;
+        log(p.id+' 429 → 待機 ('+rateHit+'/4)','lw');
+        await sleep(3000+rateHit*2500+rnd(0,1500));
+        if(rateHit>4){pvFail(p,'429');break}
+        continue;
       }
-      const tk=await mailReq(p.base,'/token',{method:'POST',ip,
-        body:JSON.stringify({address:addr,password:pw})});
-      if(tk.body&&tk.body.token)return{address:addr,token:tk.body.token,base:p.base,ip};
+      if(res.badDomain){
+        markBadDomain(dom);live=live.filter(d=>d!==dom);a++;continue;
+      }
+      if(!res.address){pvFail(p,'create '+(res.status||'?'));break}
+      pvOk(p);
+      return{...res,base:p.base,p,ip};
     }
   }
-  throw new Error('mail 全滅（プロバイダがIP拒否 / プロキシ未設定）');
+  throw new Error('mail 全滅（全プロバイダ枯れ / プロキシ未設定）');
 }
 
-async function mailMessages(mail){
-  const l=await mailReq(mail.base,'/messages',{token:mail.token,ip:mail.ip});
-  return (l.body&&(l.body['hydra:member']||l.body['member']||(Array.isArray(l.body)?l.body:[])))||[];
+/* ---------- 本文から token 抽出 ---------- */
+function cleanText(s){
+  if(!s)return '';
+  let t=String(s);
+  t=t.replace(/=\r?\n/g,'').replace(/=([0-9A-F]{2})/gi,(m,h)=>String.fromCharCode(parseInt(h,16)));
+  t=t.replace(/<(script|style)[\s\S]*?<\/\1>/gi,' ');
+  t=t.replace(/<[^>]+>/g,' ');
+  t=t.replace(/&amp;/g,'&').replace(/&quot;/g,'"').replace(/&#39;/g,"'")
+     .replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&nbsp;/g,' ');
+  return t.replace(/\s+/g,' ');
 }
-
-async function waitVerifyToken(mail){
-  for(let i=0;i<30;i++){
-    await sleep(2500);
-    let arr=[];
-    try{arr=await mailMessages(mail)}catch(e){continue}
-    if(!arr.length)continue;
-    for(const msg of arr){
-      const m=await mailReq(mail.base,'/messages/'+msg.id,{token:mail.token,ip:mail.ip});
-      const txt=JSON.stringify(m.body||{});
-      let mm=txt.match(/verify#token=([A-Za-z0-9_\-]+)/);
-      if(mm)return mm[1];
-      mm=txt.match(/upn=([A-Za-z0-9_\-%]+)/);
-      if(mm){try{
-        const dec=atob(decodeURIComponent(mm[1]).replace(/-/g,'+').replace(/_/g,'/'));
-        const m2=dec.match(/token=([A-Za-z0-9_\-]+)/);if(m2)return m2[1];
-      }catch(e){}}
-    }
-  }
-  return null;
+function decodeUpn(v){
+  try{
+    let s=decodeURIComponent(v).replace(/-/g,'+').replace(/_/g,'/');
+    while(s.length%4)s+='=';
+    return atob(s);
+  }catch(e){return ''}
 }
-
-async function waitResetToken(mail){
-  for(let i=0;i<30;i++){
-    await sleep(2500);
-    let arr=[];
-    try{arr=await mailMessages(mail)}catch(e){continue}
-    for(const msg of arr){
-      const subj=String(msg.subject||'');
-      const m=await mailReq(mail.base,'/messages/'+msg.id,{token:mail.token,ip:mail.ip});
-      const txt=JSON.stringify(m.body||{});
-      let mm=txt.match(/reset#token=([A-Za-z0-9_\-\.]+)/);
-      if(!mm&&/reset|password|パスワード/i.test(subj+txt))mm=txt.match(/token=([A-Za-z0-9_\-\.]{20,})/);
-      if(mm)return mm[1];
-    }
+function findToken(raw,kind){
+  const t=cleanText(raw);
+  if(kind==='verify'){
+    let m=t.match(/verify#token=([A-Za-z0-9_\-]+)/);if(m)return m[1];
+    m=t.match(/[?&]upn=([A-Za-z0-9_\-%]+)/);
+    if(m){const d=decodeUpn(m[1]);const m2=d.match(/token=([A-Za-z0-9_\-]+)/);if(m2)return m2[1]}
+    m=t.match(/\/(?:verify|authorize)[^\s"']*[?&]token=([A-Za-z0-9_\-]+)/);if(m)return m[1];
+    m=t.match(/[?&]token=([A-Za-z0-9_\-]{20,})/);if(m)return m[1];
+  }else{
+    let m=t.match(/reset#token=([A-Za-z0-9_\-\.]+)/);if(m)return m[1];
+    m=t.match(/\/(?:reset|reset-password)[^\s"']*[?&]token=([A-Za-z0-9_\-\.]+)/);if(m)return m[1];
+    m=t.match(/[?&]token=([A-Za-z0-9_\-\.]{20,})/);if(m)return m[1];
   }
   return null;
 }
 
-/* ---------- 事前準備（IP ごとに1回だけ） ---------- */
+async function pollToken(mail,kind){
+  const seen=new Set();
+  for(let i=0;i<40;i++){
+    await sleep(2500);
+    let arr=[];
+    try{arr=await mail.p.list(mail)}catch(e){continue}
+    for(const m of arr){
+      if(seen.has(m.id))continue;
+      seen.add(m.id);
+      let raw=m.raw;
+      if(!raw&&mail.p.read){try{raw=await mail.p.read(mail,m.id)}catch(e){raw=''}}
+      const tok=findToken((m.subject||'')+'\n'+(raw||''),kind);
+      if(tok)return tok;
+    }
+    if(kind==='reset'&&i>3&&!arr.length)continue;
+  }
+  return null;
+}
+const waitVerifyToken=mail=>pollToken(mail,'verify');
+const waitResetToken=mail=>pollToken(mail,'reset');
+
+/* ---------- 事前準備 ---------- */
 async function prepare(ip,prof){
   const s=ipState(ipKey(ip));
   if(s.prepped)return;
@@ -1104,17 +1350,66 @@ async function recoverAccount(mail,password,ip,prof){
   return lg2.token||null;
 }
 
-// チャレンジ取得は「本登録と同じ本文」で行う。
-// 空ボディだと captcha が実リクエストに紐づかず、captcha-required を食い直す。
 function beginRegister(payload,ip,prof){
   return dfetch('/auth/register',{method:'POST',isReg:true,retries:0,retry5xx:false,ip,prof,
     body:JSON.stringify({...payload,captcha_key:null})});
+}
+
+/* ---------- ドメイン生存確認 ---------- */
+async function probeOne(dom,ip,prof){
+  const payload={username:pick(ADJ)+pick(NOUN)+rnd(10,9999),password:randStr(12)+'Aa1!',
+    email:randStr(20)+'@'+dom,consent:true,fingerprint:prof.fingerprint,captcha_key:null,
+    date_of_birth:'2000-01-01',gift_code_sku_id:null,unique_username_registration:true};
+  const r=await beginRegister(payload,ip,prof);
+  const raw=JSON.stringify(r.body||{});
+  if(/EMAIL_ALREADY_REGISTERED/.test(raw))return'burned';
+  if(r.status===429)return'rate';
+  if(needsCaptcha(r.body))return'ok';
+  if(r.status===200)return'ok';
+  if(/EMAIL_/.test(raw))return'ng';
+  return'?HTTP'+r.status;
+}
+
+async function probeDomains(){
+  if(!proxyEndpoint()){log('生存確認にはプロキシエンドポイントが必要','le');return}
+  const cands=[];
+  for(const p of MAIL_PROVIDERS){
+    if(!p.on)continue;
+    const doms=await provDomains(p,null).catch(()=>[]);
+    for(const d of doms.slice(0,3))cands.push({prov:p.id,dom:d});
+    if(cands.length>=10)break;
+  }
+  if(!cands.length){log('確認するドメインが無い','le');return}
+
+  const ip=await acquireIp();
+  const prof=makeProfile();
+  await prepare(ip,prof);
+  $('#probeOut').textContent='';
+  const good=[];
+  for(const c of cands){
+    if(stopped)break;
+    let res='err';
+    try{res=await probeOne(c.dom,ip,prof)}catch(e){res='err'}
+    $('#probeOut').textContent+=(res==='ok'?'○ ':res==='burned'?'× ':'? ')+c.prov+':'+c.dom+' → '+res+'\n';
+    log('probe '+c.prov+':'+c.dom+' → '+res,res==='ok'?'lg':'ld');
+    if(res==='ok')good.push(c.prov+':'+c.dom);
+    if(res==='burned')markBadDomain(c.dom);
+    await sleep(2500);
+  }
+  if(good.length){
+    $('#mailUse').value=good.join('\n');
+    localStorage.setItem('dts_mailUse',$('#mailUse').value);
+    log('優先ドメインに '+good.length+' 件を設定','lg');
+  }else{
+    log('使えるドメインが 1 件も無い。プロバイダ追加か自前ドメインが必要','le');
+  }
 }
 
 async function registerOne(){
   const prof=makeProfile();
   let ip=await acquireIp();
   let ok=false;
+  let dupOnly=true;
   let last=null;
   try{
     await prepare(ip,prof);
@@ -1125,20 +1420,33 @@ async function registerOne(){
       let mail=null;
       if($('#useEmail').checked){
         try{mail=await makeMail(ip)}
-        catch(e){log('メール作成失敗: '+e.message,'le');await backoff(attempt);continue}
+        catch(e){log('メール作成失敗: '+e.message,'le');dupOnly=false;await backoff(attempt);continue}
       }
-      if(mail)log('addr: '+mail.address,'ld');
+      if(mail)log('addr: '+mail.address+' ('+mail.p.id+')','ld');
 
       const payload={username,password,email:mail?mail.address:undefined,consent:true,
         fingerprint:prof.fingerprint,captcha_key:null,date_of_birth:'2000-01-01',
         gift_code_sku_id:null,unique_username_registration:true};
 
-      // 1) 本登録と同じ本文でチャレンジを取る（pending ユーザーはできるが captcha が紐づく）
       const b=await beginRegister(payload,ip,prof);
       log('reg(pre): '+b.status+' '+(b.text||'').slice(0,120),'ld');
+      const rawB=JSON.stringify(b.body||{});
 
+      if(/EMAIL_ALREADY_REGISTERED/.test(rawB)){
+        const dom=mail?mail.address.split('@')[1]:'';
+        if(dom)markBadDomain(dom);
+        log('ドメイン枯れ ('+(dom||'?')+') → 別ドメインで作り直し','lw');
+        if($('#recoverOnDup').checked&&mail){
+          dupOnly=false;
+          const tk=await recoverAccount(mail,creds[mail.address]||password,ip,prof);
+          if(tk){sRec++;$('#sRec').textContent=sRec;log('回収: '+mail.address,'lg');ok=true;
+            return await finish(tk,username,mail,ip,prof)}
+        }
+        await sleep(900);continue;
+      }
       if(b.status===429){
         $('#s429').textContent=+$('#s429').textContent+1;
+        dupOnly=false;
         last=new Error('HTTP 429');
         ip=await rotateIp(ip);
         continue;
@@ -1148,18 +1456,18 @@ async function registerOne(){
         ok=true;return await finish(b.body.token,username,mail,ip,prof);
       }
       if(!needsCaptcha(b.body)){
+        dupOnly=false;
         const detail=(b.body&&b.body.errors)?JSON.stringify(b.body.errors):(b.text||('HTTP '+b.status));
         last=new Error(detail.slice(0,200));
         await backoff(attempt);continue;
       }
       const ch=capChallenge(b);
 
-      // 2) solve
       let cap=null;
       try{cap=await solveCaptcha(ch,'https://discord.com/register',ip,prof)}
       catch(e){
         last=e;last.captcha=true;
-        // 決定的: captcha で落ちても pending ユーザーは既に存在する → 先に回収する
+        dupOnly=false;
         if(mail){
           log('solver 失敗 → 回収を先に試す','ld');
           const tk=await recoverAccount(mail,password,ip,prof);
@@ -1169,7 +1477,6 @@ async function registerOne(){
         await backoff(attempt);continue;
       }
 
-      // 3) 本登録（同じセッションIDで送る）
       const r=await postRegister({...payload,...capFields(ch,cap)},capHeaders(ch,cap),ip,prof);
       log('reg: '+r.status+' '+(r.text||'').slice(0,160),'ld');
 
@@ -1179,11 +1486,13 @@ async function registerOne(){
       }
       if(r.status===429){
         $('#s429').textContent=+$('#s429').textContent+1;
+        dupOnly=false;
         last=new Error('HTTP 429');
         ip=await rotateIp(ip);
         continue;
       }
       if((r.status===0||r.status>=500)&&mail){
+        dupOnly=false;
         log('5xx → 回収を確認','ld');
         const tk=await recoverAccount(mail,password,ip,prof);
         if(tk){sRec++;$('#sRec').textContent=sRec;log('回収: '+mail.address,'lg');ok=true;
@@ -1192,44 +1501,54 @@ async function registerOne(){
         await backoff(attempt);continue;
       }
       if(needsCaptcha(r.body)){
+        dupOnly=false;
         log('captcha 失効 → 振り直し','lw');
         last=new Error('captcha');last.captcha=true;
         await backoff(attempt);continue;
       }
       const raw=JSON.stringify(r.body||{});
       if(/EMAIL_ALREADY_REGISTERED/.test(raw)&&mail){
-        log('既登録 → 回収を試行','ld');
-        const tk=await recoverAccount(mail,creds[mail.address]||password,ip,prof);
-        if(tk){sRec++;$('#sRec').textContent=sRec;log('回収: '+mail.address,'lg');ok=true;
-          return await finish(tk,username,mail,ip,prof)}
+        const dom=mail.address.split('@')[1];
+        if(dom)markBadDomain(dom);
+        log('既登録 → 別ドメインで作り直し','ld');
+        if($('#recoverOnDup').checked){
+          dupOnly=false;
+          const tk=await recoverAccount(mail,creds[mail.address]||password,ip,prof);
+          if(tk){sRec++;$('#sRec').textContent=sRec;log('回収: '+mail.address,'lg');ok=true;
+            return await finish(tk,username,mail,ip,prof)}
+        }
         last=new Error('EMAIL_ALREADY_REGISTERED');
-        await backoff(attempt);continue;
+        await sleep(900);continue;
       }
       if(/USERNAME_TAKEN|USERNAME_INVALID/.test(raw)){
+        dupOnly=false;
         log('ユーザー名衝突 → 名前を変えて再試行','ld');
         last=new Error('USERNAME_TAKEN');
         await sleep(1200);continue;
       }
+      dupOnly=false;
       const detail=(r.body&&r.body.errors)?JSON.stringify(r.body.errors):(r.text||('HTTP '+r.status));
       last=new Error(detail.slice(0,220));
       await backoff(attempt);
     }
     throw last;
   }finally{
-    releaseIp(ip,ok?'ok':'fail');
+    releaseIp(ip,ok?'ok':(dupOnly?'ok':'fail'));
   }
 }
 
 let sOk=0,sNg=0,sCap=0;
 async function runGen(){
   stopped=false;
-  const total=num('#genCount',10,1,500),conc=num('#genConc',1,1,10),gap=num('#genGap',2000,0,60000);
+  const total=num('#genCount',10,1,500),conc=num('#genConc',1,1,10),gap=num('#genGap',3000,0,60000);
   if(!proxyEndpoint()&&$('#useEmail').checked){log('プロキシ未設定: メール作成が CORS で失敗します','lw')}
   if(!hasKey())log('captcha キー未設定: captcha で止まります','lw');
   if(!proxyActive()&&$('#autoProxy').checked){
     log('プロキシ未設定 → 自動取得します','ld');
     await loadAutoProxies();
   }
+  const act=MAIL_PROVIDERS.filter(p=>p.on).map(p=>p.id);
+  log('有効プロバイダ '+act.length+' 件: '+act.join(', '),'ld');
   if(proxyActive()){
     log('プロキシ '+proxyList().length+' 本で開始（登録間隔 '+$('#regGap').value+'s / IP上限 '+$('#ipMax').value+'）','ld');
     if(!$('#capUseProxy').checked)log('captcha が proxyless です。IP 不一致で UNSOLVABLE になりやすいので ON 推奨','lw');
@@ -1399,6 +1718,7 @@ $('#btnImport').onclick=async()=>{$('#btnImport').disabled=true;try{await import
 $('#btnCopy').onclick=()=>{navigator.clipboard.writeText(tokens.map(o=>o.t).join('\n'));log('コピーしました','ld')};
 $('#btnClear').onclick=()=>{tokens=[];save();renderTokens();log('トークン消去','ld')};
 $('#btnProxyLoad').onclick=async()=>{$('#btnProxyLoad').disabled=true;try{await loadAutoProxies()}finally{$('#btnProxyLoad').disabled=false}};
+$('#btnProbe').onclick=async()=>{$('#btnProbe').disabled=true;try{await probeDomains()}finally{$('#btnProbe').disabled=false}};
 $('#btnProxyClear').onclick=()=>{
   $('#proxyList').value='';
   localStorage.setItem('dts_proxyList','');
@@ -1406,7 +1726,31 @@ $('#btnProxyClear').onclick=()=>{
   log('プロキシ一覧を消去','ld');
 };
 
-['proxyUrl','proxyKey','capKey','capProv','capUseProxy','proxyList','proxyOn','autoPurge','msg','spamCount','spamGap','spamJitter','spamConc','chanOrder','spamRetry','randMsg','genCount','genConc','genGap','useEmail','joinConc','joinGap','joinSkip','guildId','chanIds','inviteCode','importVerify','stickyIp','ipMax','ipCool','ipGap','regGap','rateCool','preflight','fpSpoof','smartIp','autoProxy','proxySrc','proxyWant','proxyCheckConc']
+/* プロバイダのチェックボックス生成 */
+(function buildProvs(){
+  const box=$('#mailProvs');
+  const saved=localStorage.getItem('dts_mailProv');
+  if(saved){
+    try{
+      const on=new Set(JSON.parse(saved));
+      MAIL_PROVIDERS.forEach(p=>p.on=on.has(p.id));
+    }catch(e){}
+  }
+  MAIL_PROVIDERS.forEach(p=>{
+    const l=document.createElement('label');
+    const c=document.createElement('input');c.type='checkbox';c.checked=p.on;
+    c.addEventListener('change',()=>{
+      p.on=c.checked;
+      localStorage.setItem('dts_mailProv',
+        JSON.stringify(MAIL_PROVIDERS.filter(x=>x.on).map(x=>x.id)));
+      log('プロバイダ '+p.id+': '+(p.on?'有効':'無効'),'ld');
+    });
+    const s=document.createElement('span');s.textContent=p.name;
+    l.append(c,s);box.appendChild(l);
+  });
+})();
+
+['proxyUrl','proxyKey','capKey','capProv','capUseProxy','proxyList','proxyOn','autoPurge','msg','spamCount','spamGap','spamJitter','spamConc','chanOrder','spamRetry','randMsg','genCount','genConc','genGap','useEmail','joinConc','joinGap','joinSkip','guildId','chanIds','inviteCode','importVerify','stickyIp','ipMax','ipCool','ipGap','regGap','rateCool','preflight','fpSpoof','smartIp','autoProxy','proxySrc','proxyWant','proxyCheckConc','mailUse','mailBan','recoverOnDup','provShuffle']
 .forEach(id=>{const el=$('#'+id);const k='dts_'+id;
   const v=localStorage.getItem(k);
   if(v!==null){if(el.type==='checkbox')el.checked=v==='1';else el.value=v}
@@ -1422,12 +1766,14 @@ $('#capProv').addEventListener('change',()=>log('captcha サービス変更: '+c
 $('#capUseProxy').addEventListener('change',()=>log('captcha のプロキシ使用: '+($('#capUseProxy').checked?'ON':'OFF'),'ld'));
 $('#ipGap').addEventListener('change',()=>log('同一 IP 最小間隔: '+$('#ipGap').value+'s','ld'));
 $('#regGap').addEventListener('change',()=>log('登録API最小間隔: '+$('#regGap').value+'s','ld'));
+$('#mailUse').addEventListener('change',()=>log('優先ドメイン: '+(preferredDomains().map(o=>o.dom).join(', ')||'(自動)'),'ld'));
+$('#mailBan').addEventListener('change',()=>log('除外ドメイン: '+(splitList($('#mailBan').value).join(', ')||'(なし)'),'ld'));
 
 function syncWarn(){$('#keyWarn').style.display=hasKey()?'none':'block'}
 syncWarn();
 renderTokens();
 if(hasKey())log('APIキー読込済 ('+capProv()+'): '+mask($('#capKey').value.trim()),'ld');
-log('準備完了。','ld');
+log('準備完了。有効プロバイダ '+MAIL_PROVIDERS.filter(p=>p.on).length+' 件','ld');
 })();
 </script>
 </div>
