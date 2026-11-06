@@ -1,0 +1,4 @@
+{
+  "private": true,
+  "dependencies": { "undici": "^6.19.0" }
+}
