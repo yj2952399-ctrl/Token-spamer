@@ -1,15 +1,17 @@
 const ALLOW = new Set([
   'discord.com', 'discordapp.com', 'cdn.discordapp.com', 'click.discord.com',
-  'api.mail.tm', '2captcha.com', 'api.yescaptcha.com',
+  'api.mail.tm', 'api.mail.gw', '2captcha.com', 'api.yescaptcha.com',
   'api.proxyscrape.com', 'api.ipify.org', 'raw.githubusercontent.com',
-  'proxylist.geonode.com',
+  'proxylist.geonode.com', 'api.openproxylist.xyz', 'www.proxy-list.download',
+  'proxy-list.download',
 ]);
 
 const FWD = [
   'content-type', 'authorization', 'x-super-properties', 'x-discord-locale',
   'x-discord-timezone', 'user-agent', 'accept', 'accept-language', 'cookie',
   'x-discord-cookie', 'x-fingerprint', 'x-captcha-key', 'x-captcha-rqtoken',
-  'x-captcha-session-id', 'x-captcha-rqdata',
+  'x-captcha-session-id', 'x-captcha-rqdata', 'origin', 'referer',
+  'x-debug-options', 'x-discord-client-properties', 'priority',
 ];
 
 const HOP = new Set([
@@ -42,6 +44,19 @@ const err = (msg, status) => ({
   body: JSON.stringify({ error: msg }),
 });
 
+// undici の ProxyAgent が使えれば CONNECT で HTTPS を正しく中継する。
+// 使えない環境では従来の URL 書き換えにフォールバックする。
+let ProxyAgentCls = null;
+async function agentFor(up) {
+  if (!up) return undefined;
+  if (!ProxyAgentCls) {
+    try { ({ ProxyAgent: ProxyAgentCls } = await import('undici')); } catch { return undefined; }
+  }
+  const [h, p, user, pass] = up.split(':');
+  const auth = user ? `${encodeURIComponent(user)}:${encodeURIComponent(pass || '')}@` : '';
+  return new ProxyAgentCls(`http://${auth}${h}:${p}`);
+}
+
 exports.handler = async (event) => {
   if (event.httpMethod === 'OPTIONS') return { statusCode: 204, headers: cors, body: '' };
 
@@ -57,9 +72,10 @@ exports.handler = async (event) => {
   for (const k of FWD) if (event.headers[k]) headers[k] = event.headers[k];
   if (headers['x-discord-cookie']) headers.cookie = headers['x-discord-cookie'];
 
-  let dest = q.url;
   const up = event.headers['x-upstream-proxy'];
-  if (up) {
+  const dispatcher = await agentFor(up);
+  let dest = t.toString();
+  if (up && !dispatcher) {
     const [h, p, user, pass] = up.split(':');
     if (h && p) {
       dest = `http://${h}:${p}${t.pathname}${t.search}`;
@@ -80,7 +96,14 @@ exports.handler = async (event) => {
 
   let r;
   try {
-    r = await fetch(dest, { method: event.httpMethod, headers, body, signal: ctl.signal, redirect: 'manual' });
+    r = await fetch(dest, {
+      method: event.httpMethod,
+      headers,
+      body,
+      signal: ctl.signal,
+      redirect: 'manual',
+      ...(dispatcher ? { dispatcher } : {}),
+    });
   } catch (e) {
     return err('upstream: ' + String(e), 502);
   } finally {
@@ -93,7 +116,6 @@ exports.handler = async (event) => {
     if (HOP.has(k.toLowerCase())) return;
     out[k] = v;
   });
-  // 複数 Set-Cookie は multiValueHeaders で個別に返す（潰すとジャーが壊れる）
   const sc = typeof r.headers.getSetCookie === 'function' ? r.headers.getSetCookie() : [];
   if (sc.length) mv['set-cookie'] = sc;
 
