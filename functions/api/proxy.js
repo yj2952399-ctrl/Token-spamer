@@ -1,16 +1,18 @@
 // /api/proxy?url=<target>&key=<PROXY_KEY>
 const ALLOW = new Set([
   'discord.com', 'discordapp.com', 'cdn.discordapp.com', 'click.discord.com',
-  'api.mail.tm', '2captcha.com', 'api.yescaptcha.com',
+  'api.mail.tm', 'api.mail.gw', '2captcha.com', 'api.yescaptcha.com',
   'api.proxyscrape.com', 'api.ipify.org', 'raw.githubusercontent.com',
-  'proxylist.geonode.com',
+  'proxylist.geonode.com', 'api.openproxylist.xyz', 'www.proxy-list.download',
+  'proxy-list.download',
 ]);
 
 const FWD = [
   'content-type', 'authorization', 'x-super-properties', 'x-discord-locale',
   'x-discord-timezone', 'user-agent', 'accept', 'accept-language', 'cookie',
   'x-discord-cookie', 'x-fingerprint', 'x-captcha-key', 'x-captcha-rqtoken',
-  'x-captcha-session-id', 'x-captcha-rqdata',
+  'x-captcha-session-id', 'x-captcha-rqdata', 'origin', 'referer',
+  'x-debug-options', 'x-discord-client-properties', 'priority',
 ];
 
 const HOP = new Set([
@@ -20,7 +22,6 @@ const HOP = new Set([
   'proxy-authorization',
 ]);
 
-// Set-Cookie は '*' では公開されないので明示列挙する
 const EXPOSE = [
   'set-cookie', 'retry-after',
   'x-ratelimit-limit', 'x-ratelimit-remaining', 'x-ratelimit-reset',
