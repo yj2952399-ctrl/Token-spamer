@@ -89,8 +89,8 @@
     <div><label>同時実行</label><input id="genConc" type="number" value="1" min="1" max="10"></div>
     <div><label>試行間隔 (ms)</label><input id="genGap" type="number" value="2000" min="0" max="60000"></div>
   </div>
-  <div class="chk"><input type="checkbox" id="useEmail" checked><span>メール認証まで自動でやる (mail.tm / プロキシ必須)</span></div>
-  <div class="hint">プロキシ未設定なら自回線 1 本で回ります。その場合は設定タブの「登録APIの最小間隔」と「同一 IP の最小間隔」で間隔を調整してください。</div>
+  <div class="chk"><input type="checkbox" id="useEmail" checked><span>メール認証まで自動でやる (mail.tm / mail.gw / プロキシ必須)</span></div>
+  <div class="hint">プロキシは成功率で自動的に重み付けされます。通らない IP は自動で隔離・除外されるので、最初に多めに入れておくと後半が安定します。</div>
   <div class="btns">
     <button class="btn" id="btnGen">生成開始</button>
     <button class="btn sec" id="btnStop1">停止</button>
@@ -171,14 +171,17 @@
   <h3>プロキシ自動取得</h3>
   <div class="chk"><input type="checkbox" id="autoProxy"><span>プロキシを自動取得・検証して使う（未設定時のみ起動）</span></div>
   <label>取得元 URL（1行1個 / host:port 形式を返すもの）</label>
-  <textarea id="proxySrc" rows="3">https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&protocol=http&proxy_format=protocolipport&format=text</textarea>
+  <textarea id="proxySrc" rows="3">https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&protocol=http&proxy_format=protocolipport&format=text
+https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt
+https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt
+https://api.openproxylist.xyz/http.txt</textarea>
   <div class="row">
     <div><label>集める本数</label><input id="proxyWant" type="number" value="20" min="1" max="200"></div>
     <div><label>検証の同時数</label><input id="proxyCheckConc" type="number" value="8" min="1" max="30"></div>
   </div>
   <div class="btns"><button class="btn sec" id="btnProxyLoad">今すぐ取得・検証</button><button class="btn ghost" id="btnProxyClear">プロキシ全消去</button></div>
   <div class="stat"><div><b id="pOk">0</b>有効</div><div><b id="pNg">0</b>不合格</div></div>
-  <div class="hint">取得したプロキシは上流プロキシ欄へ追記されます。無料の HTTP プロキシは寿命が短いので、1 アカウントごとに検証し直す前提で使ってください。Netlify の Function 呼び出し回数は 1 本につき 1 回消費します。</div>
+  <div class="hint">検証は api.ipify.org ではなく Discord の gateway エンドポイントで行います。ipify が通っても Discord が通らない個体はここで落ちます。</div>
 
   <h3>captcha 回避 / レート制限</h3>
   <div class="chk"><input type="checkbox" id="stickyIp" checked><span>プロキシをアカウントごとに固定する（登録とログインを同じ IP で行う）</span></div>
@@ -195,7 +198,8 @@
   </div>
   <div class="chk"><input type="checkbox" id="preflight" checked><span>事前に location-metadata を取得して locale / 国コードを合わせる</span></div>
   <div class="chk"><input type="checkbox" id="fpSpoof" checked><span>UA / super properties / fingerprint を 1 プロファイルに統一する</span></div>
-  <div class="hint">429 は IP 単位で来ます。プロキシ未設定でも自回線 1 本として同じ間隔・クールダウンが適用されます。登録APIの最小間隔は 429 が止まらないときの最初の調整点です。</div>
+  <div class="chk"><input type="checkbox" id="smartIp" checked><span>IP を成功率で重み付けし、ダメな IP を自動隔離する</span></div>
+  <div class="hint">429 は IP 単位で来ます。成功した IP は優先され、失敗が続いた IP は 10〜30 分隔離されます。</div>
 
   <label>プロキシエンドポイント</label>
   <input id="proxyUrl" value="/api/proxy" placeholder="/api/proxy">
@@ -211,16 +215,18 @@
     <summary>netlify/functions/proxy.js のコード</summary>
     <pre id="workerCode">const ALLOW = new Set([
   'discord.com', 'discordapp.com', 'cdn.discordapp.com', 'click.discord.com',
-  'api.mail.tm', '2captcha.com', 'api.yescaptcha.com',
+  'api.mail.tm', 'api.mail.gw', '2captcha.com', 'api.yescaptcha.com',
   'api.proxyscrape.com', 'api.ipify.org', 'raw.githubusercontent.com',
-  'proxylist.geonode.com',
+  'proxylist.geonode.com', 'api.openproxylist.xyz', 'www.proxy-list.download',
+  'proxy-list.download',
 ]);
 
 const FWD = [
   'content-type', 'authorization', 'x-super-properties', 'x-discord-locale',
   'x-discord-timezone', 'user-agent', 'accept', 'accept-language', 'cookie',
   'x-discord-cookie', 'x-fingerprint', 'x-captcha-key', 'x-captcha-rqtoken',
-  'x-captcha-session-id', 'x-captcha-rqdata',
+  'x-captcha-session-id', 'x-captcha-rqdata', 'origin', 'referer',
+  'x-debug-options', 'x-discord-client-properties', 'priority',
 ];
 
 const HOP = new Set([
@@ -253,6 +259,17 @@ const err = (msg, status) =&gt; ({
   body: JSON.stringify({ error: msg }),
 });
 
+let ProxyAgentCls = null;
+async function agentFor(up) {
+  if (!up) return undefined;
+  if (!ProxyAgentCls) {
+    try { ({ ProxyAgent: ProxyAgentCls } = await import('undici')); } catch { return undefined; }
+  }
+  const [h, p, user, pass] = up.split(':');
+  const auth = user ? `${encodeURIComponent(user)}:${encodeURIComponent(pass || '')}@` : '';
+  return new ProxyAgentCls(`http://${auth}${h}:${p}`);
+}
+
 exports.handler = async (event) =&gt; {
   if (event.httpMethod === 'OPTIONS') return { statusCode: 204, headers: cors, body: '' };
 
@@ -268,9 +285,10 @@ exports.handler = async (event) =&gt; {
   for (const k of FWD) if (event.headers[k]) headers[k] = event.headers[k];
   if (headers['x-discord-cookie']) headers.cookie = headers['x-discord-cookie'];
 
-  let dest = q.url;
   const up = event.headers['x-upstream-proxy'];
-  if (up) {
+  const dispatcher = await agentFor(up);
+  let dest = t.toString();
+  if (up &amp;&amp; !dispatcher) {
     const [h, p, user, pass] = up.split(':');
     if (h &amp;&amp; p) {
       dest = `http://${h}:${p}${t.pathname}${t.search}`;
@@ -291,7 +309,14 @@ exports.handler = async (event) =&gt; {
 
   let r;
   try {
-    r = await fetch(dest, { method: event.httpMethod, headers, body, signal: ctl.signal, redirect: 'manual' });
+    r = await fetch(dest, {
+      method: event.httpMethod,
+      headers,
+      body,
+      signal: ctl.signal,
+      redirect: 'manual',
+      ...(dispatcher ? { dispatcher } : {}),
+    });
   } catch (e) {
     return err('upstream: ' + String(e), 502);
   } finally {
@@ -374,7 +399,7 @@ function saveCred(a,p){
   try{localStorage.setItem('dts_creds',JSON.stringify(creds))}catch(e){}
 }
 
-/* ---------- IP スケジューラ ---------- */
+/* ---------- IP スケジューラ（成功率学習つき） ---------- */
 const DIRECT='__direct__';
 const ips=new Map();
 let globalUntil=0;
@@ -385,7 +410,8 @@ function seedCookies(){
 }
 function ipState(k){
   let s=ips.get(k);
-  if(!s){s={used:0,nextAt:0,coolUntil:0,regNextAt:0,prepped:false,jar:seedCookies()};ips.set(k,s)}
+  if(!s){s={used:0,nextAt:0,coolUntil:0,regNextAt:0,prepped:false,jar:seedCookies(),
+    ok:0,ng:0,bannedUntil:0,reuseAt:0};ips.set(k,s)}
   return s;
 }
 function mergeCookies(k,sc){
@@ -407,6 +433,25 @@ function ipFor(opt){
 }
 const regGapMs=()=>num('#regGap',20,5,3600)*1000;
 
+function ipWeight(k){
+  const s=ipState(k);
+  const rate=(s.ok+1)/(s.ok+s.ng+2);
+  return Math.max(0.04,rate*rate);
+}
+function pickWeighted(list){
+  if(!$('#smartIp').checked)return pick(list);
+  const ws=list.map(p=>ipWeight(ipKey(p)));
+  const total=ws.reduce((a,b)=>a+b,0);
+  let r=Math.random()*total;
+  for(let i=0;i<list.length;i++){r-=ws[i];if(r<=0)return list[i]}
+  return list[list.length-1];
+}
+function usable(p,now,maxPer,gapMs){
+  const s=ipState(ipKey(p));
+  return !(s.bannedUntil&&now<s.bannedUntil)
+    && s.used<maxPer && now>=s.coolUntil && now>=s.nextAt+gapMs && now>=s.reuseAt;
+}
+
 async function waitSlot(ip,isReg){
   const s=ipState(ipKey(ip));
   for(let i=0;i<4000;i++){
@@ -425,11 +470,22 @@ async function acquireIp(){
   for(let spin=0;spin<4000;spin++){
     if(stopped)return useProxy?expandProxy(pick(list)):null;
     const now=Date.now();
-    const cands=list.filter(p=>{const s=ipState(ipKey(p));
+    const cands=list.filter(p=>usable(p,now,maxPer,gapMs));
+    if(cands.length)return useProxy?expandProxy(pickWeighted(cands)):null;
+
+    // 全滅に近いなら隔離を一時解除してでも進む
+    const soft=list.filter(p=>{const s=ipState(ipKey(p));
       return s.used<maxPer&&now>=s.coolUntil&&now>=s.nextAt+gapMs});
-    if(cands.length)return useProxy?expandProxy(pick(cands)):null;
+    if(soft.length&&spin%12===11){
+      const p=pickWeighted(soft);
+      const s=ipState(ipKey(p));
+      s.bannedUntil=0;s.reuseAt=0;
+      log('隔離を解除して再試行: '+p,'ld');
+      return useProxy?expandProxy(p):null;
+    }
     const waits=list.map(p=>{const s=ipState(ipKey(p));
-      return Math.max(s.coolUntil-now,s.nextAt+gapMs-now,600)});
+      return Math.max(s.coolUntil-now,s.nextAt+gapMs-now,s.reuseAt-now,
+        (s.bannedUntil&&s.bannedUntil>now)?s.bannedUntil-now:0,600)});
     const w=Math.min(...waits);
     $('#sIp').textContent=+$('#sIp').textContent+1;
     log((useProxy?'IP 待ち ':'間隔待ち ')+Math.ceil(w/1000)+'s','ld');
@@ -437,22 +493,28 @@ async function acquireIp(){
   }
   return useProxy?expandProxy(pick(list)):null;
 }
-// mode: 'ok' | 'fail' | 'rate'。1試行につき finally で1回だけ呼ぶ
+// mode: 'ok' | 'fail' | 'rate'
 function releaseIp(ip,mode){
   const s=ipState(ipKey(ip));
   if(mode==='rate'){
-    s.coolUntil=Math.max(s.coolUntil,Date.now()+num('#rateCool',300,60,3600)*1000);
-    s.used=0;return;
+    s.ng++;s.used=0;
+    const cool=num('#rateCool',300,60,3600)*1000;
+    s.coolUntil=Math.max(s.coolUntil,Date.now()+cool);
+    s.reuseAt=Date.now()+cool;
+    if(s.ok===0&&s.ng>=3){s.bannedUntil=Date.now()+30*60000;log('IP 隔離(429×3)','lw')}
+    return;
   }
   if(mode==='ok'){
-    s.used++;
+    s.ok++;s.used++;
     if(s.used>=num('#ipMax',1,1,50)){
       s.coolUntil=Date.now()+num('#ipCool',3,0,1440)*60000;
       s.used=0;
     }
     return;
   }
+  s.ng++;
   s.nextAt=Date.now()+2000;
+  if(s.ok===0&&s.ng>=3){s.bannedUntil=Date.now()+10*60000;log('IP 隔離(失敗×3)','lw')}
 }
 async function rotateIp(cur){
   const next=await acquireIp();
@@ -528,6 +590,14 @@ function applyRate(k,h,isReg){
   if(isReg)s.regNextAt=Math.max(s.regNextAt,Date.now()+regGapMs());
 }
 
+function pageFor(path){
+  if(path.indexOf('/auth/register')===0)return 'https://discord.com/register';
+  if(path.indexOf('/auth/login')===0)return 'https://discord.com/login';
+  if(path.indexOf('/auth/forgot')===0)return 'https://discord.com/reset-password';
+  if(path.indexOf('/auth/verify')===0)return 'https://discord.com/verify';
+  return 'https://discord.com/app';
+}
+
 // 429 は「そのIPの冷却を立てて、基本は呼び出し元に返す」。
 // POST は既定でリトライしない（二重送信を避ける）。GET だけ2回まで。
 async function dfetch(path,opt={}){
@@ -544,11 +614,18 @@ async function dfetch(path,opt={}){
     await waitSlot(up,isReg);
 
     const prof=$('#fpSpoof').checked?opt.prof:null;
+    const sp=prof?prof.super:SUPER;
+    const page=pageFor(path);
     const h={'Content-Type':'application/json','Accept':'*/*',
-      'X-Super-Properties':prof?prof.super:SUPER,
+      'X-Super-Properties':sp,
+      'X-Discord-Client-Properties':sp,
       'X-Discord-Locale':prof?prof.locale:'en-US',
       'X-Discord-Timezone':prof?prof.tz:localTz,
-      'X-Discord-Cookie':ipState(key).jar};
+      'X-Discord-Cookie':ipState(key).jar,
+      'X-Debug-Options':'bugReporterEnabled',
+      'Origin':'https://discord.com',
+      'Referer':page,
+      'Priority':'u=1, i'};
     if(prof){h['User-Agent']=prof.ua;h['Accept-Language']=prof.lang;h['X-Fingerprint']=prof.fingerprint}
     if(opt.token)h.Authorization=opt.token;
     if(up)h['X-Upstream-Proxy']=up;
@@ -573,8 +650,9 @@ async function dfetch(path,opt={}){
       const scope=(r.headers.get('x-ratelimit-scope')||'user').toLowerCase();
       const glob=r.headers.get('x-ratelimit-global')==='true'||scope==='global';
       const s=ipState(key);
-      s.used=0;
+      s.used=0;s.ng++;
       s.coolUntil=Math.max(s.coolUntil,Date.now()+ra*1000);
+      s.reuseAt=Date.now()+ra*1000;
       if(glob)globalUntil=Math.max(globalUntil,Date.now()+Math.min(ra*1000,600000));
       log('429 → '+ra.toFixed(1)+'s 冷却 ('+scope+(glob?' / GLOBAL':'')+')','lw');
       if(attempt>=maxTries)return{status:429,body:j,text:txt,rate:true,headers:r.headers,ip:up};
@@ -588,20 +666,26 @@ async function dfetch(path,opt={}){
   }
 }
 
-/* ---------- プロキシ自動取得 ---------- */
+/* ---------- プロキシ自動取得（Discord 実疎通で検証） ---------- */
 let pOk=0,pNg=0;
 async function checkProxy(p){
   const ep=proxyEndpoint();if(!ep)return null;
-  const url=withKey(ep+(ep.includes('?')?'&':'?')+'url='+encodeURIComponent('https://api.ipify.org?format=json'));
-  const ctl=new AbortController();
-  const t=setTimeout(()=>ctl.abort(),9000);
-  try{
-    const r=await fetch(url,{headers:{'X-Upstream-Proxy':p},signal:ctl.signal});
-    if(!r.ok)return null;
-    const j=await r.json();
-    return j&&j.ip?j.ip:null;
-  }catch(e){return null}
-  finally{clearTimeout(t)}
+  const hit=async(target)=>{
+    const url=withKey(ep+(ep.includes('?')?'&':'?')+'url='+encodeURIComponent(target));
+    const ctl=new AbortController();
+    const t=setTimeout(()=>ctl.abort(),10000);
+    try{return await fetch(url,{headers:{'X-Upstream-Proxy':p,'Accept':'*/*'},signal:ctl.signal})}
+    catch(e){return null}
+    finally{clearTimeout(t)}
+  };
+  const g=await hit('https://discord.com/api/v9/gateway');
+  if(!g||g.status!==200)return null;
+  const gj=await g.json().catch(()=>null);
+  if(!gj||!gj.url)return null;
+  const i=await hit('https://api.ipify.org?format=json');
+  if(!i||!i.ok)return null;
+  const ij=await i.json().catch(()=>null);
+  return ij&&ij.ip?ij.ip:null;
 }
 async function loadAutoProxies(){
   const srcs=$('#proxySrc').value.split('\n').map(x=>x.trim()).filter(Boolean);
@@ -804,63 +888,111 @@ async function solveCaptcha(ch,pageurl,ip,prof){
   throw new Error('solver timeout');
 }
 
-/* ---------- mail.tm ---------- */
-const MAIL='https://api.mail.tm';
-async function mailReq(path,opt={}){
+/* ---------- 使い捨てメール（ドメイン学習つき） ---------- */
+const MAIL_PROVIDERS=[
+  {name:'mail.gw', base:'https://api.mail.gw'},
+  {name:'mail.tm', base:'https://api.mail.tm'}
+];
+const DOMAIN_FALLBACK={
+  'https://api.mail.gw':['mail.gw','playpc.io','dragonmail.live','binkmail.com'],
+  'https://api.mail.tm':['mail.tm','punkproof.com','bestsoundeffects.com','uorak.com','email-temp.com']
+};
+const domainCache={};
+const badDomains=new Map();
+const domUsable=d=>{const u=badDomains.get(d);return !u||Date.now()>u};
+function markBadDomain(d){badDomains.set(d,Date.now()+30*60000);log('ドメイン隔離: '+d,'ld')}
+
+async function mailReq(base,path,opt={}){
   const ep=proxyEndpoint();if(!ep)throw new Error('no proxy');
-  const url=withKey(ep+(ep.includes('?')?'&':'?')+'url='+encodeURIComponent(MAIL+path));
-  const h={'Content-Type':'application/json'};if(opt.token)h.Authorization='Bearer '+opt.token;
+  const url=withKey(ep+(ep.includes('?')?'&':'?')+'url='+encodeURIComponent(base+path));
+  const h={'Content-Type':'application/json','Accept':'application/ld+json, application/json'};
+  if(opt.token)h.Authorization='Bearer '+opt.token;
+  if(opt.ip)h['X-Upstream-Proxy']=opt.ip;
   const r=await fetch(url,{method:opt.method||'GET',headers:h,body:opt.body});
   const t=await r.text();let j=null;try{j=JSON.parse(t)}catch(e){}
-  return{status:r.status,body:j};
+  return{status:r.status,body:j,text:t};
 }
-let mailDomains=null;
-async function getDomains(){
-  if(mailDomains)return mailDomains;
-  const d=await mailReq('/domains');
-  mailDomains=((d.body&&d.body['hydra:member'])||[]).map(x=>x.domain);
-  return mailDomains;
-}
-async function makeMail(){
-  const doms=await getDomains();
-  if(!doms.length)throw new Error('domain');
-  for(let a=0;a<10;a++){
-    const addr=randStr(20)+'@'+pick(doms);
-    const pw=randStr(14)+'Aa1!';
-    const c=await mailReq('/accounts',{method:'POST',body:JSON.stringify({address:addr,password:pw})});
-    if(c.status===429){await sleep(4000);continue}
-    if(c.status!==201)continue;
-    const tk=await mailReq('/token',{method:'POST',body:JSON.stringify({address:addr,password:pw})});
-    if(tk.body&&tk.body.token)return{address:addr,token:tk.body.token};
+
+async function mailDomainsOf(base){
+  if(domainCache[base]){
+    const fresh=domainCache[base].filter(domUsable);
+    if(fresh.length)return fresh;
   }
-  throw new Error('mail fail');
+  for(let i=0;i<3;i++){
+    const d=await mailReq(base,'/domains?page=1');
+    const arr=(d.body&&(d.body['hydra:member']||d.body['member']||(Array.isArray(d.body)?d.body:[])))||[];
+    const doms=arr.map(x=>x&&x.domain).filter(Boolean).filter(domUsable);
+    if(doms.length){domainCache[base]=doms;return doms}
+    log('domain 取得失敗 '+new URL(base).hostname+' HTTP '+d.status+' '+
+      String(d.text||'').replace(/\s+/g,' ').slice(0,70),'lw');
+    await sleep(1500*(i+1));
+  }
+  return [];
 }
+
+async function makeMail(ip){
+  const order=[...MAIL_PROVIDERS].sort(()=>Math.random()-.5);
+  for(const p of order){
+    let doms=[];
+    try{doms=await mailDomainsOf(p.base)}catch(e){}
+    if(!doms.length)doms=(DOMAIN_FALLBACK[p.base]||[]).filter(domUsable);
+    if(!doms.length)continue;
+
+    for(let a=0;a<6;a++){
+      const dom=pick(doms);
+      const addr=randStr(20)+'@'+dom;
+      const pw=randStr(14)+'Aa1!';
+      const c=await mailReq(p.base,'/accounts',{method:'POST',ip,
+        body:JSON.stringify({address:addr,password:pw})});
+      if(c.status===429){log('mail 429 → 待機','lw');await sleep(4000);continue}
+      if(c.status===422||c.status===400||c.status===404){markBadDomain(dom);continue}
+      if(c.status!==201){
+        log('mail 作成不可 '+p.name+' HTTP '+c.status+' '+
+          String(c.text||'').replace(/\s+/g,' ').slice(0,70),'lw');
+        break;
+      }
+      const tk=await mailReq(p.base,'/token',{method:'POST',ip,
+        body:JSON.stringify({address:addr,password:pw})});
+      if(tk.body&&tk.body.token)return{address:addr,token:tk.body.token,base:p.base,ip};
+    }
+  }
+  throw new Error('mail 全滅（プロバイダがIP拒否 / プロキシ未設定）');
+}
+
+async function mailMessages(mail){
+  const l=await mailReq(mail.base,'/messages',{token:mail.token,ip:mail.ip});
+  return (l.body&&(l.body['hydra:member']||l.body['member']||(Array.isArray(l.body)?l.body:[])))||[];
+}
+
 async function waitVerifyToken(mail){
   for(let i=0;i<30;i++){
     await sleep(2500);
-    const l=await mailReq('/messages',{token:mail.token});
-    const arr=(l.body&&l.body['hydra:member'])||[];
+    let arr=[];
+    try{arr=await mailMessages(mail)}catch(e){continue}
     if(!arr.length)continue;
-    const m=await mailReq('/messages/'+arr[0].id,{token:mail.token});
-    const txt=JSON.stringify(m.body||{});
-    let mm=txt.match(/verify#token=([A-Za-z0-9_\-]+)/);
-    if(mm)return mm[1];
-    mm=txt.match(/upn=([A-Za-z0-9_\-%]+)/);
-    if(mm){try{
-      const dec=atob(decodeURIComponent(mm[1]).replace(/-/g,'+').replace(/_/g,'/'));
-      const m2=dec.match(/token=([A-Za-z0-9_\-]+)/);if(m2)return m2[1];
-    }catch(e){}}
+    for(const msg of arr){
+      const m=await mailReq(mail.base,'/messages/'+msg.id,{token:mail.token,ip:mail.ip});
+      const txt=JSON.stringify(m.body||{});
+      let mm=txt.match(/verify#token=([A-Za-z0-9_\-]+)/);
+      if(mm)return mm[1];
+      mm=txt.match(/upn=([A-Za-z0-9_\-%]+)/);
+      if(mm){try{
+        const dec=atob(decodeURIComponent(mm[1]).replace(/-/g,'+').replace(/_/g,'/'));
+        const m2=dec.match(/token=([A-Za-z0-9_\-]+)/);if(m2)return m2[1];
+      }catch(e){}}
+    }
   }
   return null;
 }
+
 async function waitResetToken(mail){
   for(let i=0;i<30;i++){
     await sleep(2500);
-    const l=await mailReq('/messages',{token:mail.token});
-    const arr=(l.body&&l.body['hydra:member'])||[];
+    let arr=[];
+    try{arr=await mailMessages(mail)}catch(e){continue}
     for(const msg of arr){
       const subj=String(msg.subject||'');
-      const m=await mailReq('/messages/'+msg.id,{token:mail.token});
+      const m=await mailReq(mail.base,'/messages/'+msg.id,{token:mail.token,ip:mail.ip});
       const txt=JSON.stringify(m.body||{});
       let mm=txt.match(/reset#token=([A-Za-z0-9_\-\.]+)/);
       if(!mm&&/reset|password|パスワード/i.test(subj+txt))mm=txt.match(/token=([A-Za-z0-9_\-\.]{20,})/);
@@ -899,7 +1031,6 @@ function postRegister(payload,headers,ip,prof){
     body:JSON.stringify(payload),headers});
 }
 
-// verify は必ず通す。captcha が出たら解く。通らなければ ok にしない。
 async function finish(tok,username,mail,ip,prof){
   if(!mail)return{token:tok,user:username,status:'unverified'};
   const vt=await waitVerifyToken(mail);
@@ -973,9 +1104,14 @@ async function recoverAccount(mail,password,ip,prof){
   return lg2.token||null;
 }
 
+// チャレンジ取得は「本登録と同じ本文」で行う。
+// 空ボディだと captcha が実リクエストに紐づかず、captcha-required を食い直す。
+function beginRegister(payload,ip,prof){
+  return dfetch('/auth/register',{method:'POST',isReg:true,retries:0,retry5xx:false,ip,prof,
+    body:JSON.stringify({...payload,captcha_key:null})});
+}
+
 async function registerOne(){
-  const username=pick(ADJ)+pick(NOUN)+rnd(10,9999);
-  const password=randStr(12)+'Aa1!';
   const prof=makeProfile();
   let ip=await acquireIp();
   let ok=false;
@@ -983,47 +1119,70 @@ async function registerOne(){
   try{
     await prepare(ip,prof);
 
-    for(let attempt=0;attempt<4;attempt++){
-      const mail=$('#useEmail').checked?await makeMail():null;
+    for(let attempt=0;attempt<3;attempt++){
+      const username=pick(ADJ)+pick(NOUN)+rnd(10,9999);
+      const password=randStr(12)+'Aa1!';
+      let mail=null;
+      if($('#useEmail').checked){
+        try{mail=await makeMail(ip)}
+        catch(e){log('メール作成失敗: '+e.message,'le');await backoff(attempt);continue}
+      }
       if(mail)log('addr: '+mail.address,'ld');
 
       const payload={username,password,email:mail?mail.address:undefined,consent:true,
         fingerprint:prof.fingerprint,captcha_key:null,date_of_birth:'2000-01-01',
         gift_code_sku_id:null,unique_username_registration:true};
 
-      // 1) 空ボディでチャレンジだけ取る（ユーザーは作られない）
-      const chRes=await dfetch('/auth/register',{method:'POST',isReg:true,retries:0,retry5xx:false,
-        ip,prof,body:'{}'});
-      if(chRes.status===429){last=new Error('429(challenge)');ip=await rotateIp(ip);continue}
-      if(!needsCaptcha(chRes.body)){
-        last=new Error('challenge 取得失敗 HTTP '+chRes.status+' '+(chRes.text||'').slice(0,80));
-        log('challenge 取れず → 振り直し','lw');await backoff(attempt);continue;
+      // 1) 本登録と同じ本文でチャレンジを取る（pending ユーザーはできるが captcha が紐づく）
+      const b=await beginRegister(payload,ip,prof);
+      log('reg(pre): '+b.status+' '+(b.text||'').slice(0,120),'ld');
+
+      if(b.status===429){
+        $('#s429').textContent=+$('#s429').textContent+1;
+        last=new Error('HTTP 429');
+        ip=await rotateIp(ip);
+        continue;
       }
-      const ch=capChallenge(chRes);
+      if(b.status===200&&b.body&&b.body.token){
+        if(mail)saveCred(mail.address,password);
+        ok=true;return await finish(b.body.token,username,mail,ip,prof);
+      }
+      if(!needsCaptcha(b.body)){
+        const detail=(b.body&&b.body.errors)?JSON.stringify(b.body.errors):(b.text||('HTTP '+b.status));
+        last=new Error(detail.slice(0,200));
+        await backoff(attempt);continue;
+      }
+      const ch=capChallenge(b);
 
       // 2) solve
       let cap=null;
       try{cap=await solveCaptcha(ch,'https://discord.com/register',ip,prof)}
-      catch(e){log('solver 失敗 ('+e.message+') → 振り直し','lw');last=e;last.captcha=true;await backoff(attempt);continue}
+      catch(e){
+        last=e;last.captcha=true;
+        // 決定的: captcha で落ちても pending ユーザーは既に存在する → 先に回収する
+        if(mail){
+          log('solver 失敗 → 回収を先に試す','ld');
+          const tk=await recoverAccount(mail,password,ip,prof);
+          if(tk){sRec++;$('#sRec').textContent=sRec;log('回収: '+mail.address,'lg');ok=true;
+            return await finish(tk,username,mail,ip,prof)}
+        }
+        await backoff(attempt);continue;
+      }
 
-      // 3) 本登録は 1 発だけ
+      // 3) 本登録（同じセッションIDで送る）
       const r=await postRegister({...payload,...capFields(ch,cap)},capHeaders(ch,cap),ip,prof);
       log('reg: '+r.status+' '+(r.text||'').slice(0,160),'ld');
 
       if(r.status===200&&r.body&&r.body.token){
         if(mail)saveCred(mail.address,password);
-        ok=true;
-        return await finish(r.body.token,username,mail,ip,prof);
+        ok=true;return await finish(r.body.token,username,mail,ip,prof);
       }
-
       if(r.status===429){
         $('#s429').textContent=+$('#s429').textContent+1;
         last=new Error('HTTP 429');
         ip=await rotateIp(ip);
         continue;
       }
-
-      // 5xx / 通信断: 成立してる可能性が高いので回収を先に確認
       if((r.status===0||r.status>=500)&&mail){
         log('5xx → 回収を確認','ld');
         const tk=await recoverAccount(mail,password,ip,prof);
@@ -1032,25 +1191,25 @@ async function registerOne(){
         last=new Error('HTTP '+r.status);
         await backoff(attempt);continue;
       }
-
-      // 返ってきたのがまた captcha 要求（トークン失効）→ 振り直して解き直す
       if(needsCaptcha(r.body)){
         log('captcha 失効 → 振り直し','lw');
         last=new Error('captcha');last.captcha=true;
         await backoff(attempt);continue;
       }
-
       const raw=JSON.stringify(r.body||{});
       if(/EMAIL_ALREADY_REGISTERED/.test(raw)&&mail){
         log('既登録 → 回収を試行','ld');
         const tk=await recoverAccount(mail,creds[mail.address]||password,ip,prof);
         if(tk){sRec++;$('#sRec').textContent=sRec;log('回収: '+mail.address,'lg');ok=true;
           return await finish(tk,username,mail,ip,prof)}
-        log('回収失敗 → 振り直し','ld');
         last=new Error('EMAIL_ALREADY_REGISTERED');
         await backoff(attempt);continue;
       }
-
+      if(/USERNAME_TAKEN|USERNAME_INVALID/.test(raw)){
+        log('ユーザー名衝突 → 名前を変えて再試行','ld');
+        last=new Error('USERNAME_TAKEN');
+        await sleep(1200);continue;
+      }
       const detail=(r.body&&r.body.errors)?JSON.stringify(r.body.errors):(r.text||('HTTP '+r.status));
       last=new Error(detail.slice(0,220));
       await backoff(attempt);
@@ -1247,7 +1406,7 @@ $('#btnProxyClear').onclick=()=>{
   log('プロキシ一覧を消去','ld');
 };
 
-['proxyUrl','proxyKey','capKey','capProv','capUseProxy','proxyList','proxyOn','autoPurge','msg','spamCount','spamGap','spamJitter','spamConc','chanOrder','spamRetry','randMsg','genCount','genConc','genGap','useEmail','joinConc','joinGap','joinSkip','guildId','chanIds','inviteCode','importVerify','stickyIp','ipMax','ipCool','ipGap','regGap','rateCool','preflight','fpSpoof','autoProxy','proxySrc','proxyWant','proxyCheckConc']
+['proxyUrl','proxyKey','capKey','capProv','capUseProxy','proxyList','proxyOn','autoPurge','msg','spamCount','spamGap','spamJitter','spamConc','chanOrder','spamRetry','randMsg','genCount','genConc','genGap','useEmail','joinConc','joinGap','joinSkip','guildId','chanIds','inviteCode','importVerify','stickyIp','ipMax','ipCool','ipGap','regGap','rateCool','preflight','fpSpoof','smartIp','autoProxy','proxySrc','proxyWant','proxyCheckConc']
 .forEach(id=>{const el=$('#'+id);const k='dts_'+id;
   const v=localStorage.getItem(k);
   if(v!==null){if(el.type==='checkbox')el.checked=v==='1';else el.value=v}
